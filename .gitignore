@@ -1,0 +1,25 @@
+# Python
+venv/
+.venv/
+__pycache__/
+.pycache/
+*.py[cod]
+*.so
+
+# Environment and secrets
+.env
+.env.*
+
+# Runtime data
+checker.db
+checker.db-*
+sessions/
+uploads/
+results/
+*.log
+*.lock
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

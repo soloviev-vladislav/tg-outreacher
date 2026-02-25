@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Управление аккаунтами</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link">Проверка</a>
+            <a href="/outreach" class="nav-link">Рассылки</a>
+            <a href="/accounts" class="nav-link active">Аккаунты</a>
+            <a href="/proxies" class="nav-link">Прокси</a>
+        </div>
+
+        <h1 class="page-title">Аккаунты</h1>
+
+        <div class="stats-row" id="accountStats">
+            <div class="stat-item">
+                <div class="stat-value" id="totalAccounts">0</div>
+                <div class="stat-label">Всего</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="checkerAccounts">0</div>
+                <div class="stat-label">Checker</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="outreachAccounts">0</div>
+                <div class="stat-label">Outreach</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="activeToday">0</div>
+                <div class="stat-label">Активны сегодня</div>
+            </div>
+        </div>
+
+        <div class="btn-group" style="margin-bottom:20px;">
+            <button class="btn btn-primary" onclick="scanSessions()">Сканировать сессии</button>
+            <button class="btn" id="uploadSessionBtn" onclick="openSessionUpload()">Загрузить .session</button>
+            <input type="file" id="sessionFileInput" accept=".session" style="display:none;" onchange="uploadSessionFile(event)">
+            <button class="btn btn-success" onclick="testAllAccounts()">Тестировать все</button>
+            <button class="btn" onclick="assignProxies()" id="assignProxiesBtn">Назначить прокси</button>
+            <button class="btn btn-warning" onclick="changeAccountType()" id="changeTypeBtn">Изменить тип</button>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:20px;">
+            <input type="text" id="searchInput" placeholder="🔍 Поиск по телефону..." class="form-control">
+            <div style="display:flex; gap:10px;">
+                <select id="typeFilter" class="form-control">
+                    <option value="">Все типы</option>
+                    <option value="checker">Checker</option>
+                    <option value="outreach">Outreach</option>
+                </select>
+                <select id="statusFilter" class="form-control">
+                    <option value="">Все статусы</option>
+                    <option value="active">Активен</option>
+                    <option value="banned">Забанен</option>
+                    <option value="frozen">Frozen</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:30px;"><input type="checkbox" id="selectAll"></th>
+                        <th>Телефон</th>
+                        <th>Тип</th>
+                        <th>Статус</th>
+                        <th>Качество</th>
+                        <th>Сегодня</th>
+                        <th>Лимит/сутки</th>
+                        <th>Прокси</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="accountsTableBody">
+                    <tr><td colspan="9" style="text-align:center; padding:40px;">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Модалка для изменения типа -->
+    <div class="modal" id="typeModal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px;">Изменить тип аккаунта</h3>
+            <p>Выбрано аккаунтов: <span id="selectedCount">0</span></p>
+            
+            <div class="form-group">
+                <label>Новый тип:</label>
+                <select id="newType" class="form-control">
+                    <option value="checker">Checker</option>
+                    <option value="outreach">Outreach</option>
+                </select>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="saveTypeChange()">Сохранить</button>
+                <button class="btn" onclick="closeTypeModal()">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модалка для назначения прокси -->
+    <div class="modal" id="proxyModal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px;">Назначить прокси</h3>
+            <p>Выбрано аккаунтов: <span id="selectedCountProxy">0</span></p>
+            
+            <div class="form-group">
+                <label>Выберите прокси:</label>
+                <select id="proxySelect" class="form-control" size="5">
+                    <option value="">Загрузка прокси...</option>
+                </select>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="saveProxyAssignment()">Назначить</button>
+                <button class="btn" onclick="closeProxyModal()">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let accounts = [];
+        let selectedAccounts = new Set();
+        let proxies = [];
+
+        document.addEventListener('DOMContentLoaded', function() {
+            loadAccounts();
+            loadProxies();
+        });
+
+        async function loadProxies() {
+            try {
+                const response = await fetch('/api/proxies');
+                proxies = await response.json();
+            } catch (e) {
+                console.error('Error loading proxies:', e);
+            }
+        }
+
+        async function loadAccounts() {
+            const response = await fetch('/api/accounts/detailed');
+            accounts = await response.json();
+            updateTable();
+            updateStats();
+        }
+
+        function updateTable() {
+            const tbody = document.getElementById('accountsTableBody');
+            const search = document.getElementById('searchInput').value.toLowerCase();
+            const type = document.getElementById('typeFilter').value;
+            const status = document.getElementById('statusFilter').value;
+
+            const filtered = accounts.filter(a => {
+                if (search && !a.phone?.toLowerCase().includes(search)) return false;
+                if (type && a.account_type !== type) return false;
+                if (status === 'active' && (a.is_banned || a.is_frozen)) return false;
+                if (status === 'banned' && !a.is_banned) return false;
+                if (status === 'frozen' && !a.is_frozen) return false;
+                return true;
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding:40px;">Нет аккаунтов</td></tr>';
+                return;
+            }
+
+            const today = new Date().toISOString().split('T')[0];
+            
+            tbody.innerHTML = filtered.map(a => {
+                const checked = selectedAccounts.has(a.phone) ? 'checked' : '';
+                return `
+                <tr onclick="handleRowClick(event, '${a.phone}')" style="cursor:pointer;">
+                    <td onclick="event.stopPropagation()"><input type="checkbox" value="${a.phone}" ${checked} onchange="toggleSelect('${a.phone}')"></td>
+                    <td><strong>${a.phone || 'Неизвестно'}</strong></td>
+                    <td><span class="badge ${a.account_type === 'outreach' ? 'badge-success' : ''}">${a.account_type}</span></td>
+                    <td><span class="badge ${a.is_frozen ? 'badge-danger' : a.is_banned ? 'badge-warning' : 'badge-success'}">
+                        ${a.is_frozen ? 'Frozen' : a.is_banned ? 'Бан' : 'Активен'}
+                    </span></td>
+                    <td><span class="badge ${a.test_quality === 'good' ? 'badge-success' : a.test_quality === 'bad' ? 'badge-danger' : ''}">
+                        ${a.test_quality || 'unknown'}
+                    </span></td>
+                    <td>${a.last_check_date === today ? a.checked_today : 0}/${a.account_type === 'outreach' ? (a.outreach_daily_limit || 20) : 20}</td>
+                    <td>${a.account_type === 'outreach' ? (a.outreach_daily_limit || 20) : '—'}</td>
+                    <td>${a.proxy_id ? '✅' : '❌'}</td>
+                    <td onclick="event.stopPropagation()">
+                        <button class="btn btn-small" onclick="testAccount('${a.phone}')">Тест</button>
+                        ${a.account_type === 'outreach' ? `<button class="btn btn-small" onclick="setOutreachLimit('${a.phone}', ${a.outreach_daily_limit || 20})">Лимит</button>` : ''}
+                    </td>
+                </tr>
+            `}).join('');
+        }
+
+        function handleRowClick(event, phone) {
+            if (event.target.type !== 'checkbox' && !event.target.classList.contains('btn')) {
+                const checkbox = event.currentTarget.querySelector('input[type="checkbox"]');
+                checkbox.checked = !checkbox.checked;
+                toggleSelect(phone);
+            }
+        }
+
+        function updateStats() {
+            document.getElementById('totalAccounts').textContent = accounts.length;
+            document.getElementById('checkerAccounts').textContent = accounts.filter(a => a.account_type === 'checker').length;
+            document.getElementById('outreachAccounts').textContent = accounts.filter(a => a.account_type === 'outreach').length;
+            
+            const today = new Date().toISOString().split('T')[0];
+            const active = accounts.filter(a => !a.is_banned && !a.is_frozen && 
+                (a.last_check_date !== today || a.checked_today < (a.account_type === 'outreach' ? (a.outreach_daily_limit || 20) : 20))).length;
+            document.getElementById('activeToday').textContent = active;
+        }
+
+        async function setOutreachLimit(phone, currentLimit) {
+            const raw = prompt('Новый суточный лимит для outreach аккаунта (1..500):', String(currentLimit || 20));
+            if (raw === null) return;
+            const limit = Number(raw);
+            if (!Number.isFinite(limit) || limit < 1 || limit > 500) {
+                alert('Введите число от 1 до 500');
+                return;
+            }
+            const response = await fetch(`/api/accounts/${encodeURIComponent(phone)}/outreach-limit`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({outreach_daily_limit: Math.floor(limit)})
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                alert(data.error || 'Ошибка сохранения лимита');
+                return;
+            }
+            await loadAccounts();
+        }
+
+        function toggleSelect(phone) {
+            if (selectedAccounts.has(phone)) {
+                selectedAccounts.delete(phone);
+            } else {
+                selectedAccounts.add(phone);
+            }
+            updateSelectAllCheckbox();
+        }
+
+        function updateSelectAllCheckbox() {
+            const selectAll = document.getElementById('selectAll');
+            if (selectAll) {
+                selectAll.checked = selectedAccounts.size === accounts.length && accounts.length > 0;
+                selectAll.indeterminate = selectedAccounts.size > 0 && selectedAccounts.size < accounts.length;
+            }
+        }
+
+        document.getElementById('selectAll').addEventListener('change', (e) => {
+            if (e.target.checked) {
+                accounts.forEach(a => selectedAccounts.add(a.phone));
+            } else {
+                selectedAccounts.clear();
+            }
+            updateTable();
+        });
+
+        document.getElementById('searchInput').addEventListener('input', updateTable);
+        document.getElementById('typeFilter').addEventListener('change', updateTable);
+        document.getElementById('statusFilter').addEventListener('change', updateTable);
+
+        async function scanSessions() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Сканирование...';
+            await fetch('/api/accounts/scan', {method:'POST'});
+            await loadAccounts();
+            btn.disabled = false;
+            btn.textContent = 'Сканировать сессии';
+        }
+
+        function openSessionUpload() {
+            const input = document.getElementById('sessionFileInput');
+            if (input) input.click();
+        }
+
+        async function uploadSessionFile(e) {
+            const input = e.target;
+            const file = input.files && input.files[0];
+            if (!file) return;
+
+            const btn = document.getElementById('uploadSessionBtn');
+            const initialText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Загрузка...';
+
+            try {
+                const form = new FormData();
+                form.append('file', file);
+                const response = await fetch('/api/accounts/upload-session', {
+                    method: 'POST',
+                    body: form
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    alert(data.error || 'Ошибка загрузки .session');
+                    return;
+                }
+                await loadAccounts();
+                alert(data.message || `Сессия загружена: ${data.phone || 'ok'}`);
+            } catch (err) {
+                alert(`Ошибка загрузки: ${err.message || err}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = initialText;
+                input.value = '';
+            }
+        }
+
+        async function testAllAccounts() {
+            if (!confirm('Тестировать все аккаунты?')) return;
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Тестирование...';
+            await fetch('/api/accounts/test-all', {method:'POST'});
+            await loadAccounts();
+            btn.disabled = false;
+            btn.textContent = 'Тестировать все';
+        }
+
+        async function testAccount(phone) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = '...';
+            await fetch(`/api/accounts/${encodeURIComponent(phone)}/test`, {method:'POST'});
+            await loadAccounts();
+            btn.disabled = false;
+            btn.textContent = 'Тест';
+        }
+
+        function changeAccountType() {
+            if (selectedAccounts.size === 0) {
+                alert('Выберите аккаунты');
+                return;
+            }
+            document.getElementById('selectedCount').textContent = selectedAccounts.size;
+            document.getElementById('typeModal').classList.add('active');
+        }
+
+        function closeTypeModal() {
+            document.getElementById('typeModal').classList.remove('active');
+        }
+
+        async function saveTypeChange() {
+            const newType = document.getElementById('newType').value;
+            const phones = Array.from(selectedAccounts);
+            
+            for (const phone of phones) {
+                await fetch(`/api/accounts/${encodeURIComponent(phone)}/update-type`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({account_type: newType})
+                });
+            }
+            
+            closeTypeModal();
+            await loadAccounts();
+            selectedAccounts.clear();
+            updateSelectAllCheckbox();
+            alert(`Тип изменен на ${newType} для ${phones.length} аккаунтов`);
+        }
+
+        function assignProxies() {
+            if (selectedAccounts.size === 0) {
+                alert('Выберите аккаунты');
+                return;
+            }
+            
+            const activeProxies = proxies.filter(p => p.is_active);
+            const select = document.getElementById('proxySelect');
+            
+            if (activeProxies.length === 0) {
+                select.innerHTML = '<option value="">Нет активных прокси</option>';
+            } else {
+                select.innerHTML = activeProxies.map(p => 
+                    `<option value="${p.id}">${p.ip}:${p.port} (${p.protocol})</option>`
+                ).join('');
+            }
+            
+            document.getElementById('selectedCountProxy').textContent = selectedAccounts.size;
+            document.getElementById('proxyModal').classList.add('active');
+        }
+
+        function closeProxyModal() {
+            document.getElementById('proxyModal').classList.remove('active');
+        }
+
+        async function saveProxyAssignment() {
+            const proxyId = document.getElementById('proxySelect').value;
+            if (!proxyId) {
+                alert('Выберите прокси');
+                return;
+            }
+            
+            const response = await fetch('/api/accounts/assign-proxy', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    phones: Array.from(selectedAccounts),
+                    proxy_id: parseInt(proxyId)
+                })
+            });
+            
+            if (response.ok) {
+                closeProxyModal();
+                await loadAccounts();
+                selectedAccounts.clear();
+                updateSelectAllCheckbox();
+                alert('Прокси назначены');
+            }
+        }
+    </script>
+</body>
+</html>

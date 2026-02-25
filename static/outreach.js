@@ -1,0 +1,805 @@
+let currentCampaignId = null;
+let campaigns = [];
+let accounts = [];
+let selectedCampaignAccounts = new Set();
+let templates = [];
+let refreshTimer = null;
+let blacklistRows = [];
+let blacklistSet = new Set();
+
+const SELECTED_CAMPAIGN_KEY = 'outreach_selected_campaign_id';
+
+document.addEventListener('DOMContentLoaded', async () => {
+    setupEventListeners();
+    await Promise.all([loadAccounts(), loadTemplates(), loadCampaigns(), loadBlacklist()]);
+    restoreSelectedCampaign();
+    startAutoRefresh();
+});
+
+function setupEventListeners() {
+    document.getElementById('newCampaignBtn')?.addEventListener('click', newCampaign);
+    document.getElementById('saveCampaignBtn')?.addEventListener('click', saveCampaign);
+    document.getElementById('saveTemplateBtn')?.addEventListener('click', saveTemplate);
+    document.getElementById('previewSpintaxBtn')?.addEventListener('click', previewSpintax);
+
+    document.getElementById('startCampaignBtn')?.addEventListener('click', () => currentCampaignId && startCampaign(currentCampaignId));
+    document.getElementById('pauseCampaignBtn')?.addEventListener('click', () => currentCampaignId && pauseCampaign(currentCampaignId));
+    document.getElementById('stopCampaignBtn')?.addEventListener('click', () => currentCampaignId && stopCampaign(currentCampaignId));
+
+    document.getElementById('addFollowupStepBtn')?.addEventListener('click', () => addFollowupStep());
+    document.getElementById('addBlacklistBtn')?.addEventListener('click', addBlacklistFromInput);
+    document.getElementById('blacklistUserIdInput')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') addBlacklistFromInput();
+    });
+    document.getElementById('exportStepReportCsvBtn')?.addEventListener('click', () => exportStepReport('csv'));
+    document.getElementById('exportStepReportXlsxBtn')?.addEventListener('click', () => exportStepReport('xlsx'));
+
+    const uploadArea = document.getElementById('uploadArea');
+    const fileInput = document.getElementById('fileInput');
+    if (uploadArea && fileInput) {
+        uploadArea.addEventListener('click', () => fileInput.click());
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) uploadFile(file);
+        });
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) uploadFile(file);
+            fileInput.value = '';
+        });
+    }
+}
+
+function startAutoRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(async () => {
+        await loadCampaigns();
+        await loadBlacklist();
+        if (currentCampaignId) {
+            const campaign = campaigns.find(c => c.id === currentCampaignId);
+            if (campaign) {
+                updateCampaignHeader(campaign);
+                updateActionButtons(campaign.status);
+            }
+            await Promise.all([loadContacts(currentCampaignId), refreshReadiness(currentCampaignId)]);
+        }
+    }, 15000);
+}
+
+function showSaveStatus(text, isError = false) {
+    const el = document.getElementById('campaignSaveStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.className = `save-status ${isError ? 'error' : 'ok'}`;
+    setTimeout(() => {
+        if (el.textContent === text) {
+            el.textContent = '';
+            el.className = 'save-status';
+        }
+    }, 2500);
+}
+
+function normalizeCampaignStatus(status) {
+    if (!status) return 'draft';
+    return String(status).toLowerCase();
+}
+
+function statusBadgeClass(status) {
+    const st = normalizeCampaignStatus(status);
+    if (st === 'active') return 'badge-success';
+    if (st === 'paused') return 'badge-warning';
+    if (st === 'stopped') return 'badge-danger';
+    return 'badge';
+}
+
+async function loadAccounts() {
+    const response = await fetch('/api/accounts/detailed');
+    const all = await response.json();
+    accounts = (all || []).filter(a => a.account_type === 'outreach' && !a.is_banned && !a.is_frozen);
+    renderCampaignAccountsSelector();
+}
+
+async function loadBlacklist() {
+    try {
+        const response = await fetch('/api/outreach/blacklist');
+        const rows = await response.json();
+        blacklistRows = Array.isArray(rows) ? rows : [];
+        blacklistSet = new Set(blacklistRows.map(r => Number(r.user_id)).filter(n => Number.isFinite(n)));
+        renderBlacklist();
+    } catch (e) {
+        console.error('Failed to load blacklist', e);
+    }
+}
+
+function renderBlacklist() {
+    const container = document.getElementById('blacklistList');
+    if (!container) return;
+    if (!Array.isArray(blacklistRows) || blacklistRows.length === 0) {
+        container.innerHTML = '<small class="muted-text">Черный список пуст</small>';
+        return;
+    }
+    container.innerHTML = blacklistRows.map(row => `
+        <span class="template-tag" style="display:inline-flex; align-items:center; gap:6px;">
+            ${escapeHtml(String(row.user_id))}
+            <button class="btn btn-small remove-blacklist" data-user-id="${escapeHtml(String(row.user_id))}">×</button>
+        </span>
+    `).join('');
+    container.querySelectorAll('.remove-blacklist').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            const uid = Number(btn.dataset.userId);
+            if (!Number.isFinite(uid)) return;
+            await removeFromBlacklist(uid);
+        });
+    });
+}
+
+async function addBlacklistFromInput() {
+    const input = document.getElementById('blacklistUserIdInput');
+    if (!input) return;
+    const uid = Number(input.value);
+    if (!Number.isFinite(uid) || uid <= 0) {
+        showSaveStatus('Введите корректный user_id', true);
+        return;
+    }
+    const response = await fetch('/api/outreach/blacklist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: uid })
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        showSaveStatus(data.error || 'Ошибка добавления в blacklist', true);
+        return;
+    }
+    input.value = '';
+    await Promise.all([loadBlacklist(), currentCampaignId ? loadContacts(currentCampaignId) : Promise.resolve()]);
+    showSaveStatus(`user_id ${uid} добавлен в blacklist`);
+}
+
+async function removeFromBlacklist(userId) {
+    const response = await fetch(`/api/outreach/blacklist/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        showSaveStatus(data.error || 'Ошибка удаления из blacklist', true);
+        return;
+    }
+    await Promise.all([loadBlacklist(), currentCampaignId ? loadContacts(currentCampaignId) : Promise.resolve()]);
+    showSaveStatus(`user_id ${userId} удален из blacklist`);
+}
+
+function campaignsUsingAccount(phone, excludeCampaignId = null) {
+    return (campaigns || []).filter(c => {
+        if (excludeCampaignId && c.id === excludeCampaignId) return false;
+        const acc = Array.isArray(c.accounts) ? c.accounts : [];
+        return acc.includes(phone);
+    });
+}
+
+function updateCampaignAccountsSummary() {
+    const el = document.getElementById('campaignAccountsSummary');
+    if (!el) return;
+    const selected = Array.from(selectedCampaignAccounts);
+    if (!selected.length) {
+        el.textContent = 'Не выбрано ни одного аккаунта.';
+        return;
+    }
+    const busyElsewhere = selected.filter(phone => campaignsUsingAccount(phone, currentCampaignId).length > 0).length;
+    el.textContent = `Выбрано аккаунтов: ${selected.length}. Используются в других кампаниях: ${busyElsewhere}.`;
+}
+
+function renderCampaignAccountsSelector() {
+    const container = document.getElementById('campaignAccountsList');
+    if (!container) return;
+
+    if (!accounts.length) {
+        container.innerHTML = '<div class="muted-text">Нет активных outreach-аккаунтов</div>';
+        updateCampaignAccountsSummary();
+        return;
+    }
+
+    container.innerHTML = accounts.map(a => {
+        const phone = String(a.phone || '');
+        const checked = selectedCampaignAccounts.has(phone) ? 'checked' : '';
+        const usedIn = campaignsUsingAccount(phone, currentCampaignId);
+        const usageHint = usedIn.length
+            ? `Уже в: ${usedIn.map(c => escapeHtml(c.name)).join(', ')}`
+            : 'Не используется в других кампаниях';
+        const usedBadge = usedIn.length
+            ? `<span class="badge badge-warning">в ${usedIn.length} камп.</span>`
+            : `<span class="badge">свободен</span>`;
+        return `
+            <label class="account-checkitem">
+                <input type="checkbox" class="campaign-account-checkbox" value="${escapeHtml(phone)}" ${checked}>
+                <div class="account-checkitem-body">
+                    <div class="account-checkitem-top">
+                        <strong>${escapeHtml(phone)}</strong>
+                        ${usedBadge}
+                    </div>
+                    <small class="muted-text">today: ${a.checked_today || 0} · limit: ${a.outreach_daily_limit || 20} · ${usageHint}</small>
+                </div>
+            </label>
+        `;
+    }).join('');
+
+    container.querySelectorAll('.campaign-account-checkbox').forEach(input => {
+        input.addEventListener('change', () => {
+            const phone = input.value;
+            if (input.checked) {
+                selectedCampaignAccounts.add(phone);
+            } else {
+                selectedCampaignAccounts.delete(phone);
+            }
+            updateCampaignAccountsSummary();
+        });
+    });
+
+    updateCampaignAccountsSummary();
+}
+
+async function loadTemplates() {
+    const response = await fetch('/api/outreach/templates');
+    templates = await response.json();
+
+    const container = document.getElementById('templatesList');
+    if (!container) return;
+    if (!Array.isArray(templates) || templates.length === 0) {
+        container.innerHTML = '<small class="muted-text">Шаблонов пока нет</small>';
+        return;
+    }
+    container.innerHTML = templates.map(t =>
+        `<button class="template-tag" data-id="${t.id}">${t.name}</button>`
+    ).join('');
+
+    container.querySelectorAll('.template-tag').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const t = templates.find(x => String(x.id) === btn.dataset.id);
+            if (t) document.getElementById('messageTemplate').value = t.text;
+        });
+    });
+}
+
+async function loadCampaigns() {
+    const response = await fetch('/api/outreach/campaigns');
+    campaigns = await response.json();
+
+    const list = document.getElementById('campaignsList');
+    if (!list) return;
+    if (!Array.isArray(campaigns) || campaigns.length === 0) {
+        list.innerHTML = '<div class="empty-state">Кампаний нет</div>';
+        return;
+    }
+
+    list.innerHTML = campaigns.map(c => {
+        const selected = c.id === currentCampaignId ? 'selected' : '';
+        const progress = c.progress || 0;
+        return `
+            <button class="campaign-item ${selected}" data-id="${c.id}">
+                <div class="campaign-item-head">
+                    <span class="campaign-item-name">${escapeHtml(c.name)}</span>
+                    <span class="badge ${statusBadgeClass(c.status)}">${escapeHtml(normalizeCampaignStatus(c.status))}</span>
+                </div>
+                <div class="campaign-item-meta">${c.sent_count || 0}/${c.total_contacts || 0} отправлено · ${c.reply_count || 0} ответов</div>
+                <div class="progress"><div class="progress-bar" style="width:${progress}%"></div></div>
+            </button>
+        `;
+    }).join('');
+
+    list.querySelectorAll('.campaign-item').forEach(btn => {
+        btn.addEventListener('click', () => {
+            selectCampaign(Number(btn.dataset.id));
+        });
+    });
+
+    renderCampaignAccountsSelector();
+}
+
+function restoreSelectedCampaign() {
+    const savedId = Number(localStorage.getItem(SELECTED_CAMPAIGN_KEY));
+    const toSelect = campaigns.find(c => c.id === savedId) || campaigns[0];
+    if (toSelect) {
+        selectCampaign(toSelect.id);
+    } else {
+        newCampaign();
+    }
+}
+
+async function selectCampaign(campaignId) {
+    currentCampaignId = campaignId;
+    localStorage.setItem(SELECTED_CAMPAIGN_KEY, String(campaignId));
+
+    await loadCampaigns();
+
+    const campaign = campaigns.find(c => c.id === campaignId);
+    if (!campaign) return;
+
+    populateCampaignForm(campaign);
+    updateCampaignHeader(campaign);
+    updateActionButtons(campaign.status);
+
+    await Promise.all([
+        loadContacts(campaignId),
+        refreshReadiness(campaignId)
+    ]);
+}
+
+function newCampaign() {
+    currentCampaignId = null;
+    localStorage.removeItem(SELECTED_CAMPAIGN_KEY);
+
+    document.getElementById('campaignName').value = '';
+    document.getElementById('messageTemplate').value = '';
+    document.getElementById('dailyLimit').value = '20';
+    document.getElementById('delayMin').value = '5';
+    document.getElementById('delayMax').value = '15';
+    document.getElementById('scheduleStartTime').value = '10:00';
+    document.getElementById('scheduleEndTime').value = '20:00';
+    document.getElementById('hourlyLimit').value = '10';
+    document.getElementById('ignoreAfterHours').value = '24';
+
+    const days = document.getElementById('scheduleDays');
+    Array.from(days.options).forEach(o => {
+        o.selected = ['1', '2', '3', '4', '5'].includes(o.value);
+    });
+
+    selectedCampaignAccounts = new Set();
+    renderCampaignAccountsSelector();
+
+    renderFollowupSteps([]);
+
+    document.getElementById('campaignSelectionInfo').textContent = 'Новая кампания (ещё не сохранена)';
+    document.getElementById('campaignStatusBadge').textContent = 'draft';
+    document.getElementById('campaignStatusBadge').className = 'badge';
+    document.getElementById('campaignProgressText').textContent = 'Прогресс: 0/0';
+
+    document.getElementById('startCampaignBtn').disabled = true;
+    document.getElementById('pauseCampaignBtn').disabled = true;
+    document.getElementById('stopCampaignBtn').disabled = true;
+
+    document.getElementById('contactsList').innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">Сначала сохраните кампанию</td></tr>';
+    document.getElementById('contactsStats').textContent = '';
+    document.getElementById('readinessStatus').textContent = '';
+    document.getElementById('runStatus').textContent = '';
+    document.getElementById('spintaxPreview').textContent = '';
+}
+
+function populateCampaignForm(campaign) {
+    document.getElementById('campaignName').value = campaign.name || '';
+    document.getElementById('messageTemplate').value = campaign.message_template || '';
+    document.getElementById('dailyLimit').value = campaign.daily_limit || 20;
+    document.getElementById('delayMin').value = campaign.delay_min ?? 5;
+    document.getElementById('delayMax').value = campaign.delay_max ?? 15;
+
+    const selectedAccounts = campaign.accounts || [];
+    selectedCampaignAccounts = new Set(selectedAccounts.map(String));
+    renderCampaignAccountsSelector();
+
+    const schedule = campaign.schedule || {};
+    document.getElementById('scheduleStartTime').value = schedule.start_time || '10:00';
+    document.getElementById('scheduleEndTime').value = schedule.end_time || '20:00';
+    document.getElementById('hourlyLimit').value = schedule.hourly_limit || 10;
+    document.getElementById('ignoreAfterHours').value = schedule.ignore_after_hours || 24;
+
+    const selectedDays = schedule.days || [1, 2, 3, 4, 5];
+    const days = document.getElementById('scheduleDays');
+    Array.from(days.options).forEach(o => {
+        o.selected = selectedDays.includes(parseInt(o.value, 10));
+    });
+
+    const strategy = campaign.strategy || { steps: [] };
+    renderFollowupSteps(strategy.steps || []);
+}
+
+function updateCampaignHeader(campaign) {
+    document.getElementById('campaignSelectionInfo').textContent = `Выбрана кампания: ${campaign.name}`;
+    const badge = document.getElementById('campaignStatusBadge');
+    badge.textContent = normalizeCampaignStatus(campaign.status);
+    badge.className = `badge ${statusBadgeClass(campaign.status)}`;
+    document.getElementById('campaignProgressText').textContent = `Прогресс: ${campaign.sent_count || 0}/${campaign.total_contacts || 0} · ответов ${campaign.reply_count || 0}`;
+}
+
+function updateActionButtons(status) {
+    const st = normalizeCampaignStatus(status);
+    const hasCampaign = Boolean(currentCampaignId);
+    document.getElementById('startCampaignBtn').disabled = !hasCampaign || st === 'active';
+    document.getElementById('pauseCampaignBtn').disabled = !hasCampaign || st !== 'active';
+    document.getElementById('stopCampaignBtn').disabled = !hasCampaign || st === 'stopped' || st === 'draft';
+}
+
+function addFollowupStep(step = null) {
+    const container = document.getElementById('followupSteps');
+    const hint = container.querySelector('.muted-text');
+    if (hint) hint.remove();
+    const row = document.createElement('div');
+    row.className = 'followup-step';
+
+    const content = step?.content ?? '';
+
+    row.innerHTML = `
+        <div class="followup-step-grid">
+            <div>
+                <label class="followup-step-title">Фоллоуап</label>
+                <textarea class="followup-content" rows="3" placeholder="Напоминание / дополнительная ценность...">${escapeHtml(content)}</textarea>
+            </div>
+            <div class="followup-actions">
+                <button type="button" class="btn btn-small followup-up">↑</button>
+                <button type="button" class="btn btn-small followup-down">↓</button>
+                <button type="button" class="btn btn-small followup-remove">Удалить</button>
+            </div>
+        </div>
+    `;
+
+    row.querySelector('.followup-up').addEventListener('click', () => {
+        const prev = row.previousElementSibling;
+        if (prev) {
+            container.insertBefore(row, prev);
+            renumberFollowupSteps();
+        }
+    });
+    row.querySelector('.followup-down').addEventListener('click', () => {
+        const next = row.nextElementSibling;
+        if (next) {
+            container.insertBefore(next, row);
+            renumberFollowupSteps();
+        }
+    });
+    row.querySelector('.followup-remove').addEventListener('click', () => row.remove());
+    container.appendChild(row);
+    renumberFollowupSteps();
+}
+
+function renderFollowupSteps(steps) {
+    const container = document.getElementById('followupSteps');
+    container.innerHTML = '';
+
+    const normalized = (steps || []).map(step => ({
+        content: step.content || ''
+    }));
+
+    if (normalized.length === 0) {
+        const hint = document.createElement('div');
+        hint.className = 'muted-text';
+        hint.textContent = 'Шагов нет. Нажмите "+ Шаг", чтобы добавить фоллоуап.';
+        container.appendChild(hint);
+        return;
+    }
+
+    normalized.forEach(step => addFollowupStep(step));
+    renumberFollowupSteps();
+}
+
+function renumberFollowupSteps() {
+    const rows = Array.from(document.querySelectorAll('.followup-step'));
+    rows.forEach((row, idx) => {
+        const title = row.querySelector('.followup-step-title');
+        if (title) {
+            title.textContent = `Фоллоуап #${idx + 1}`;
+        }
+    });
+}
+
+function collectStrategy() {
+    const rows = Array.from(document.querySelectorAll('.followup-step'));
+    const steps = rows.map((row, idx) => {
+        const content = (row.querySelector('.followup-content')?.value || '').trim();
+        return {
+            id: idx + 2,
+            condition: 'ignored',
+            content
+        };
+    }).filter(step => step.content.length > 0);
+
+    return { steps };
+}
+
+function collectSchedule() {
+    const days = Array.from(document.getElementById('scheduleDays').selectedOptions).map(o => parseInt(o.value, 10));
+    return {
+        start_time: document.getElementById('scheduleStartTime').value,
+        end_time: document.getElementById('scheduleEndTime').value,
+        hourly_limit: parseInt(document.getElementById('hourlyLimit').value, 10) || 10,
+        ignore_after_hours: Math.max(1, parseInt(document.getElementById('ignoreAfterHours').value, 10) || 24),
+        days
+    };
+}
+
+function collectCampaignPayload() {
+    const name = document.getElementById('campaignName').value.trim();
+    const template = document.getElementById('messageTemplate').value.trim();
+    const selectedAccounts = Array.from(selectedCampaignAccounts);
+
+    return {
+        name,
+        template,
+        accounts: selectedAccounts,
+        dailyLimit: parseInt(document.getElementById('dailyLimit').value, 10) || 20,
+        delayMin: parseInt(document.getElementById('delayMin').value, 10) || 0,
+        delayMax: parseInt(document.getElementById('delayMax').value, 10) || 0,
+        schedule: collectSchedule(),
+        strategy: collectStrategy()
+    };
+}
+
+async function saveCampaign() {
+    const payload = collectCampaignPayload();
+    if (!payload.name) {
+        showSaveStatus('Введите название кампании', true);
+        return;
+    }
+    if (!payload.template) {
+        showSaveStatus('Введите текст первого сообщения', true);
+        return;
+    }
+    if (!payload.accounts.length) {
+        showSaveStatus('Выберите минимум один outreach-аккаунт', true);
+        return;
+    }
+    if (payload.delayMax < payload.delayMin) {
+        showSaveStatus('delayMax не может быть меньше delayMin', true);
+        return;
+    }
+
+    try {
+        if (currentCampaignId) {
+            const response = await fetch(`/api/outreach/campaign/${currentCampaignId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || 'Ошибка сохранения');
+            }
+        } else {
+            const response = await fetch('/api/outreach/campaigns', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || 'Ошибка создания');
+            }
+            currentCampaignId = data.id;
+            localStorage.setItem(SELECTED_CAMPAIGN_KEY, String(currentCampaignId));
+        }
+
+        showSaveStatus('Сохранено');
+        await loadCampaigns();
+        if (currentCampaignId) await selectCampaign(currentCampaignId);
+    } catch (e) {
+        showSaveStatus(e.message || 'Ошибка сохранения', true);
+    }
+}
+
+async function saveTemplate() {
+    const name = document.getElementById('templateName').value.trim();
+    const text = document.getElementById('messageTemplate').value.trim();
+    if (!name || !text) return;
+
+    await fetch('/api/outreach/templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, text })
+    });
+
+    document.getElementById('templateName').value = '';
+    await loadTemplates();
+    showSaveStatus('Шаблон сохранён');
+}
+
+async function previewSpintax() {
+    const text = (document.getElementById('messageTemplate')?.value || '').trim();
+    const previewEl = document.getElementById('spintaxPreview');
+    if (!previewEl) return;
+    if (!text) {
+        previewEl.textContent = 'Введите текст сообщения, чтобы посмотреть варианты.';
+        return;
+    }
+
+    previewEl.textContent = 'Генерирую варианты...';
+    try {
+        const response = await fetch('/api/outreach/spintax/preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, samples: 5 })
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) {
+            previewEl.textContent = data.error || 'Ошибка генерации';
+            return;
+        }
+        const variants = Array.isArray(data.variants) ? data.variants : [];
+        previewEl.innerHTML = variants.length
+            ? variants.map((v, idx) => `${idx + 1}. ${escapeHtml(v)}`).join('<br>')
+            : 'Варианты не сгенерированы';
+    } catch (e) {
+        previewEl.textContent = `Ошибка: ${e.message || e}`;
+    }
+}
+
+async function uploadFile(file) {
+    if (!currentCampaignId) {
+        showSaveStatus('Сначала сохраните кампанию', true);
+        return;
+    }
+
+    const progress = document.getElementById('uploadProgress');
+    progress.textContent = 'Загрузка...';
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('campaign_id', currentCampaignId);
+
+    const response = await fetch('/api/outreach/upload', { method: 'POST', body: formData });
+    const result = await response.json();
+
+    if (result.error) {
+        progress.textContent = `Ошибка: ${result.error}`;
+        return;
+    }
+
+    const v = result.validation || {};
+    const validationText = v.rows_total ? ` · валидно строк: ${v.rows_valid}/${v.rows_total}` : '';
+    progress.textContent = `Загружено: ${result.imported}, пропущено: ${result.skipped}${validationText}`;
+    await Promise.all([loadCampaigns(), loadContacts(currentCampaignId), refreshReadiness(currentCampaignId)]);
+}
+
+async function loadContacts(campaignId) {
+    const response = await fetch(`/api/outreach/campaign/${campaignId}/contacts?limit=100`);
+    const contacts = await response.json();
+    const campaign = campaigns.find(c => c.id === campaignId);
+
+    const tbody = document.getElementById('contactsList');
+    if (!Array.isArray(contacts) || contacts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">Контактов пока нет</td></tr>';
+        document.getElementById('contactsStats').textContent = 'Контактов: 0';
+        return;
+    }
+
+    tbody.innerHTML = contacts.map(c => `
+        <tr>
+            <td><span class="badge ${statusBadgeClass(c.status)}">${escapeHtml(c.status)}</span></td>
+            <td>
+                <strong>${escapeHtml(c.name || '—')}</strong><br>
+                <small>${escapeHtml(c.phone || '—')} ${c.username ? '@' + escapeHtml(c.username) : ''} ${c.user_id ? `(ID: ${c.user_id})` : ''}</small>
+            </td>
+            <td><small>${renderContactStepInfo(c, campaign)}</small></td>
+            <td>${escapeHtml(c.company || '-')}<br><small>${escapeHtml(c.position || '-')}</small></td>
+            <td>${escapeHtml(c.account_used || '—')}</td>
+            <td><small>${escapeHtml(c.notes || '')}</small></td>
+            <td>
+                ${c.user_id
+                    ? (blacklistSet.has(Number(c.user_id))
+                        ? '<small class="muted-text">в blacklist</small>'
+                        : `<button class="btn btn-small add-blacklist-row" data-user-id="${escapeHtml(String(c.user_id))}">В blacklist</button>`)
+                    : '<small class="muted-text">—</small>'}
+            </td>
+        </tr>
+    `).join('');
+
+    tbody.querySelectorAll('.add-blacklist-row').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const uid = Number(btn.dataset.userId);
+            if (!Number.isFinite(uid)) return;
+            const response = await fetch('/api/outreach/blacklist', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: uid })
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                showSaveStatus(data.error || 'Ошибка добавления в blacklist', true);
+                return;
+            }
+            await Promise.all([loadBlacklist(), loadContacts(campaignId)]);
+        });
+    });
+
+    const newCount = contacts.filter(c => c.status === 'new').length;
+    const sentCount = contacts.filter(c => c.status === 'sent').length;
+    const ignoredCount = contacts.filter(c => c.status === 'ignored').length;
+    const repliedCount = contacts.filter(c => c.status === 'replied').length;
+    const failedCount = contacts.filter(c => c.status === 'failed').length;
+
+    document.getElementById('contactsStats').textContent =
+        `Всего ${contacts.length} · new ${newCount} · sent ${sentCount} · ignored ${ignoredCount} · replied ${repliedCount} · failed ${failedCount}`;
+}
+
+function getOrderedFollowupStepIds(campaign) {
+    const steps = (campaign?.strategy?.steps || [])
+        .map(s => Number(s?.id))
+        .filter(id => Number.isFinite(id) && id >= 2)
+        .sort((a, b) => a - b);
+    return steps;
+}
+
+function renderContactStepInfo(contact, campaign) {
+    const lastStep = Number(contact?.last_step_id || 0) || 0;
+    const followupSteps = getOrderedFollowupStepIds(campaign);
+    const nextStep = followupSteps.find(id => id > lastStep) || null;
+
+    if (contact.status === 'new') {
+        return 'следующий: первичное (шаг 1)';
+    }
+    if (!lastStep) {
+        return 'шаг: —';
+    }
+    if (nextStep) {
+        return `текущий: ${lastStep} · следующий: ${nextStep}`;
+    }
+    return `текущий: ${lastStep} · цепочка завершена`;
+}
+
+async function refreshReadiness(campaignId) {
+    const response = await fetch(`/api/outreach/campaign/${campaignId}/readiness`);
+    const info = await response.json();
+    if (info.error) return;
+
+    const problems = [];
+    if (!info.has_api_credentials) problems.push('не заданы API ID/API Hash');
+    if (!info.has_accounts) problems.push('нет активных outreach-аккаунтов в кампании');
+    if ((info.contacts_total || 0) === 0) problems.push('не загружены контакты');
+    if ((info.new_contacts_ready || 0) === 0) problems.push('нет новых контактов для отправки');
+    if (!info.schedule_open_now) problems.push('сейчас вне окна расписания');
+
+    const readinessText = problems.length
+        ? `Сейчас не готово: ${problems.join(', ')}.`
+        : 'Кампания готова к отправке.';
+
+    document.getElementById('readinessStatus').textContent = readinessText;
+    document.getElementById('runStatus').textContent =
+        `Планировщик: ${info.scheduler_running ? 'запущен' : 'остановлен'} · аккаунтов в кампании ${info.accounts_valid}/${info.accounts_selected} · в blacklist ${info.contacts_blacklisted || 0}`;
+}
+
+function exportStepReport(format) {
+    if (!currentCampaignId) {
+        showSaveStatus('Сначала выберите кампанию', true);
+        return;
+    }
+    const fmt = (format || 'csv').toLowerCase();
+    window.open(`/api/outreach/campaign/${currentCampaignId}/step-report/export?format=${encodeURIComponent(fmt)}`, '_blank');
+}
+
+async function startCampaign(id) {
+    const response = await fetch(`/api/outreach/campaign/${id}/start`, { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        showSaveStatus(data.error || 'Ошибка запуска', true);
+        return;
+    }
+    showSaveStatus('Кампания запущена');
+    await Promise.all([loadCampaigns(), refreshReadiness(id), loadContacts(id)]);
+    await selectCampaign(id);
+}
+
+async function pauseCampaign(id) {
+    await fetch(`/api/outreach/campaign/${id}/pause`, { method: 'POST' });
+    showSaveStatus('Кампания на паузе');
+    await Promise.all([loadCampaigns(), refreshReadiness(id)]);
+    await selectCampaign(id);
+}
+
+async function stopCampaign(id) {
+    if (!confirm('Остановить кампанию?')) return;
+    await fetch(`/api/outreach/campaign/${id}/stop`, { method: 'POST' });
+    showSaveStatus('Кампания остановлена');
+    await Promise.all([loadCampaigns(), refreshReadiness(id)]);
+    await selectCampaign(id);
+}
+
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}

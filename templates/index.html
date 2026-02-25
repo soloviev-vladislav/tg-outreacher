@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Checker</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link active">Проверка</a>
+            <a href="/outreach" class="nav-link">Рассылки</a>
+            <a href="/accounts" class="nav-link">Аккаунты</a>
+            <a href="/proxies" class="nav-link">Прокси</a>
+        </div>
+
+        <h1 class="page-title">Проверка номеров</h1>
+
+        <div class="grid-3">
+            <!-- Левая панель -->
+            <div class="card">
+                <h2 class="section-title">Настройки</h2>
+                
+                <!-- API поля УДАЛЕНЫ - значения вшиты в сервер -->
+
+                <div class="form-group">
+                    <label>Целевой чат</label>
+                    <input type="text" id="targetChat" placeholder="@username" value="me">
+                </div>
+
+                <div class="form-group">
+                    <label>Задержка (сек)</label>
+                    <input type="number" id="delay" value="2" min="1" max="10">
+                </div>
+
+                <div class="form-group">
+                    <label>Номера телефонов</label>
+                    <textarea id="phones" rows="5" placeholder="+7..."></textarea>
+                </div>
+
+                <div class="upload-area" id="uploadArea">
+                    <div>📁 Нажмите или перетащите файл</div>
+                    <small style="color:#86868b;">.txt или .csv</small>
+                </div>
+                <input type="file" id="fileInput" accept=".txt,.csv" style="display:none">
+                <div id="fileName" style="margin-top:10px; font-size:12px; color:#86868b;"></div>
+
+                <div class="btn-group">
+                    <button id="startBtn" class="btn btn-primary">Старт</button>
+                    <button id="stopBtn" class="btn btn-danger" disabled>Стоп</button>
+                    <button id="clearBtn" class="btn">Очистить</button>
+                </div>
+            </div>
+
+            <!-- Центральная панель -->
+            <div class="card">
+                <h2 class="section-title">Прогресс</h2>
+                
+                <div class="stats-row" style="grid-template-columns:repeat(2,1fr); margin-bottom:20px;">
+                    <div class="stat-item">
+                        <div class="stat-value" id="processedCount">0</div>
+                        <div class="stat-label">Обработано</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="registeredCount">0</div>
+                        <div class="stat-label">Найдено</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="notRegisteredCount">0</div>
+                        <div class="stat-label">Не найдено</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="errorCount">0</div>
+                        <div class="stat-label">Ошибки</div>
+                    </div>
+                </div>
+
+                <div class="progress">
+                    <div class="progress-bar" id="progressBar" style="width:0%"></div>
+                </div>
+
+                <div class="current-item">
+                    <div style="font-size:13px; color:#86868b;">Текущий номер</div>
+                    <div class="current-value" id="currentPhone">-</div>
+                </div>
+
+                <div class="time-estimate" id="timeRemaining">Осталось: расчет...</div>
+
+                <div class="chart-wrapper">
+                    <canvas id="statsChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Правая панель -->
+            <div class="card">
+                <h2 class="section-title">Аккаунты</h2>
+                <div class="list-container" id="accountsList" style="margin-bottom:20px;"></div>
+
+                <h2 class="section-title">Результаты</h2>
+                <div class="list-container" id="recentResults" style="margin-bottom:20px;"></div>
+
+                <h2 class="section-title">Файлы</h2>
+                <div class="list-container" id="filesList"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

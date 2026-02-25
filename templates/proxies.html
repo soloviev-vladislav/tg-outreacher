@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Управление прокси</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link">Проверка</a>
+            <a href="/outreach" class="nav-link">Рассылки</a>
+            <a href="/accounts" class="nav-link">Аккаунты</a>
+            <a href="/proxies" class="nav-link active">Прокси</a>
+        </div>
+
+        <h1 class="page-title">Прокси</h1>
+
+        <div class="stats-row" id="proxyStats">
+            <div class="stat-item">
+                <div class="stat-value" id="totalProxies">0</div>
+                <div class="stat-label">Всего</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="activeProxies">0</div>
+                <div class="stat-label">Активных</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="inactiveProxies">0</div>
+                <div class="stat-label">Неактивных</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="assignedProxies">0</div>
+                <div class="stat-label">Назначено</div>
+            </div>
+        </div>
+
+        <div class="btn-group" style="margin-bottom:20px;">
+            <button class="btn btn-primary" onclick="showAddModal()">➕ Добавить</button>
+            <button class="btn btn-success" onclick="showImportModal()">📁 Импорт</button>
+            <button class="btn" onclick="testAllProxies()">🔍 Проверить все</button>
+            <button class="btn btn-danger" onclick="deleteInactiveProxies()">🗑 Очистить</button>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:20px;">
+            <input type="text" id="searchInput" placeholder="🔍 Поиск по IP..." class="form-control">
+            <div style="display:flex; gap:10px;">
+                <select id="protocolFilter" class="form-control">
+                    <option value="">Все протоколы</option>
+                    <option value="socks5">SOCKS5</option>
+                    <option value="http">HTTP</option>
+                    <option value="https">HTTPS</option>
+                </select>
+                <select id="statusFilter" class="form-control">
+                    <option value="">Все статусы</option>
+                    <option value="active">Активные</option>
+                    <option value="inactive">Неактивные</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>IP</th>
+                        <th>Порт</th>
+                        <th>Протокол</th>
+                        <th>Страна</th>
+                        <th>Статус</th>
+                        <th>Последнее использование</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="proxiesTableBody">
+                    <tr><td colspan="7" style="text-align:center; padding:40px;">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Модалка добавления -->
+    <div class="modal" id="proxyModal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px;">➕ Добавить прокси</h3>
+            
+            <div class="form-group">
+                <label>IP</label>
+                <input type="text" id="proxyIp" class="form-control" placeholder="192.168.1.1">
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Порт</label>
+                    <input type="number" id="proxyPort" class="form-control" placeholder="1080">
+                </div>
+                <div class="form-group">
+                    <label>Протокол</label>
+                    <select id="proxyProtocol" class="form-control">
+                        <option value="socks5">SOCKS5</option>
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Логин</label>
+                    <input type="text" id="proxyUsername" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label>Пароль</label>
+                    <input type="text" id="proxyPassword" class="form-control">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Страна</label>
+                <input type="text" id="proxyCountry" class="form-control" placeholder="RU">
+            </div>
+            
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="saveProxy()">Сохранить</button>
+                <button class="btn" onclick="hideModal()">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модалка импорта -->
+    <div class="modal" id="importModal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px;">📁 Импорт прокси</h3>
+            
+            <div class="upload-area" onclick="document.getElementById('importFile').click()">
+                <div>Нажмите или перетащите файл</div>
+                <small>формат: ip:port:protocol:login:password:country</small>
+            </div>
+            <input type="file" id="importFile" accept=".txt,.csv" style="display:none;" onchange="importProxies()">
+            
+            <div id="importProgress" style="display:none; margin-top:20px;">
+                <div class="progress"><div class="progress-bar" id="importProgressBar" style="width:0%"></div></div>
+                <div id="importStatus" style="text-align:center; margin-top:10px;"></div>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="btn" onclick="hideImportModal()">Закрыть</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let proxies = [];
+        let currentProxyId = null;
+
+        document.addEventListener('DOMContentLoaded', loadProxies);
+
+        async function loadProxies() {
+            const response = await fetch('/api/proxies');
+            proxies = await response.json();
+            updateTable();
+            updateStats();
+        }
+
+        function updateTable() {
+            const tbody = document.getElementById('proxiesTableBody');
+            const search = document.getElementById('searchInput').value.toLowerCase();
+            const protocol = document.getElementById('protocolFilter').value;
+            const status = document.getElementById('statusFilter').value;
+
+            const filtered = proxies.filter(p => {
+                if (search && !p.ip.includes(search) && !(p.country || '').toLowerCase().includes(search)) return false;
+                if (protocol && p.protocol !== protocol) return false;
+                if (status === 'active' && !p.is_active) return false;
+                if (status === 'inactive' && p.is_active) return false;
+                return true;
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:40px;">Нет прокси</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = filtered.map(p => `
+                <tr>
+                    <td><strong>${p.ip}</strong></td>
+                    <td>${p.port}</td>
+                    <td><span class="badge">${p.protocol}</span></td>
+                    <td>${p.country || '-'}</td>
+                    <td><span class="badge ${p.is_active ? 'badge-success' : 'badge-danger'}">${p.is_active ? 'Активен' : 'Неактивен'}</span></td>
+                    <td>${p.last_used ? new Date(p.last_used).toLocaleString() : 'Никогда'}</td>
+                    <td>
+                        <button class="btn btn-small" onclick="editProxy(${p.id})">✏️</button>
+                        <button class="btn btn-small btn-success" onclick="testProxy(${p.id})">🔍</button>
+                        <button class="btn btn-small btn-danger" onclick="deleteProxy(${p.id})">🗑️</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function updateStats() {
+            document.getElementById('totalProxies').textContent = proxies.length;
+            document.getElementById('activeProxies').textContent = proxies.filter(p => p.is_active).length;
+            document.getElementById('inactiveProxies').textContent = proxies.filter(p => !p.is_active).length;
+            document.getElementById('assignedProxies').textContent = proxies.filter(p => p.assigned_to).length;
+        }
+
+        document.getElementById('searchInput').addEventListener('input', updateTable);
+        document.getElementById('protocolFilter').addEventListener('change', updateTable);
+        document.getElementById('statusFilter').addEventListener('change', updateTable);
+
+        function showAddModal() {
+            currentProxyId = null;
+            document.getElementById('proxyIp').value = '';
+            document.getElementById('proxyPort').value = '';
+            document.getElementById('proxyProtocol').value = 'socks5';
+            document.getElementById('proxyUsername').value = '';
+            document.getElementById('proxyPassword').value = '';
+            document.getElementById('proxyCountry').value = '';
+            document.getElementById('proxyModal').classList.add('active');
+        }
+
+        function editProxy(id) {
+            const p = proxies.find(p => p.id === id);
+            if (!p) return;
+            currentProxyId = id;
+            document.getElementById('proxyIp').value = p.ip;
+            document.getElementById('proxyPort').value = p.port;
+            document.getElementById('proxyProtocol').value = p.protocol;
+            document.getElementById('proxyUsername').value = p.username || '';
+            document.getElementById('proxyPassword').value = p.password || '';
+            document.getElementById('proxyCountry').value = p.country || '';
+            document.getElementById('proxyModal').classList.add('active');
+        }
+
+        function hideModal() {
+            document.getElementById('proxyModal').classList.remove('active');
+        }
+
+        async function saveProxy() {
+            const data = {
+                ip: document.getElementById('proxyIp').value,
+                port: parseInt(document.getElementById('proxyPort').value),
+                protocol: document.getElementById('proxyProtocol').value,
+                username: document.getElementById('proxyUsername').value || null,
+                password: document.getElementById('proxyPassword').value || null,
+                country: document.getElementById('proxyCountry').value || null
+            };
+
+            if (!data.ip || !data.port) {
+                alert('Заполните IP и порт');
+                return;
+            }
+
+            const url = currentProxyId ? `/api/proxies/${currentProxyId}` : '/api/proxies';
+            const method = currentProxyId ? 'PUT' : 'POST';
+            
+            await fetch(url, {
+                method: method,
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            
+            hideModal();
+            loadProxies();
+        }
+
+        async function deleteProxy(id) {
+            if (!confirm('Удалить прокси?')) return;
+            await fetch(`/api/proxies/${id}`, {method: 'DELETE'});
+            loadProxies();
+        }
+
+        async function testProxy(id) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = '...';
+            await fetch(`/api/proxies/${id}/test`, {method: 'POST'});
+            await loadProxies();
+            btn.disabled = false;
+            btn.textContent = '🔍';
+        }
+
+        async function testAllProxies() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Проверка...';
+            await fetch('/api/proxies/test-all', {method: 'POST'});
+            await loadProxies();
+            btn.disabled = false;
+            btn.textContent = '🔍 Проверить все';
+        }
+
+        function showImportModal() {
+            document.getElementById('importModal').classList.add('active');
+        }
+
+        function hideImportModal() {
+            document.getElementById('importModal').classList.remove('active');
+            document.getElementById('importProgress').style.display = 'none';
+        }
+
+        async function importProxies() {
+            const file = document.getElementById('importFile').files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            document.getElementById('importProgress').style.display = 'block';
+            document.getElementById('importProgressBar').style.width = '0%';
+            document.getElementById('importStatus').textContent = 'Загрузка...';
+
+            const response = await fetch('/api/proxies/import', {method: 'POST', body: formData});
+            const result = await response.json();
+            
+            document.getElementById('importProgressBar').style.width = '100%';
+            document.getElementById('importStatus').textContent = `✅ Добавлено: ${result.added}, пропущено: ${result.skipped}`;
+            
+            setTimeout(() => {
+                hideImportModal();
+                loadProxies();
+            }, 2000);
+        }
+
+        async function deleteInactiveProxies() {
+            if (!confirm('Удалить все неактивные прокси?')) return;
+            await fetch('/api/proxies/delete-inactive', {method: 'DELETE'});
+            loadProxies();
+        }
+    </script>
+</body>
+</html>

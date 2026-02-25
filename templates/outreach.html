@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Outreach</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link">Проверка</a>
+            <a href="/outreach" class="nav-link active">Рассылки</a>
+            <a href="/accounts" class="nav-link">Аккаунты</a>
+            <a href="/proxies" class="nav-link">Прокси</a>
+        </div>
+
+        <h1 class="page-title">Рассылки</h1>
+
+        <div class="card" style="margin-bottom: 20px;">
+            <strong>Как работать:</strong> создайте или выберите кампанию, сохраните настройки, загрузите контакты, затем запустите кампанию.
+            В рассылке участвуют только аккаунты с типом <code>outreach</code>.
+        </div>
+
+        <div class="outreach-layout">
+            <div class="card">
+                <div class="panel-head">
+                    <h2 class="section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0;">Кампании</h2>
+                    <button id="newCampaignBtn" class="btn btn-primary btn-small">+ Новая</button>
+                </div>
+                <div id="campaignsList" class="campaigns-list">
+                    <div class="empty-state">Загрузка...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="campaign-workspace-header">
+                    <div>
+                        <h2 class="section-title" style="margin-bottom: 6px; border-bottom: none; padding-bottom: 0;">Настройки кампании</h2>
+                        <div id="campaignSelectionInfo" class="muted-text">Выберите кампанию слева или создайте новую</div>
+                    </div>
+                    <div id="campaignSaveStatus" class="save-status"></div>
+                </div>
+
+                <div class="campaign-meta-row">
+                    <div id="campaignStatusBadge" class="badge">draft</div>
+                    <div id="campaignProgressText" class="muted-text">Прогресс: 0/0</div>
+                </div>
+
+                <div class="form-group">
+                    <label>Название кампании</label>
+                    <input type="text" id="campaignName" placeholder="Например: B2B SaaS февраль">
+                </div>
+
+                <div class="form-group">
+                    <label>Аккаунты для отправки (только outreach)</label>
+                    <div id="campaignAccountsList" class="account-checklist"></div>
+                    <div id="campaignAccountsSummary" class="muted-text" style="margin-top: 8px;"></div>
+                    <small class="form-hint">Если выбрано несколько аккаунтов, сообщения отправляются по ротации (карусель).</small>
+                </div>
+
+                <div class="form-row-3">
+                    <div class="form-group">
+                        <label>Лимит в день</label>
+                        <input type="number" id="dailyLimit" value="20" min="1" max="500">
+                    </div>
+                    <div class="form-group">
+                        <label>Задержка от (мин)</label>
+                        <input type="number" id="delayMin" value="5" min="0" max="120">
+                    </div>
+                    <div class="form-group">
+                        <label>Задержка до (мин)</label>
+                        <input type="number" id="delayMax" value="15" min="0" max="120">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Первое сообщение</label>
+                    <textarea id="messageTemplate" rows="5" placeholder="Привет, {name}! ..."></textarea>
+                    <div class="variables-hint">Переменные: {name} {company} {position} {phone}</div>
+                    <div style="margin-top: 8px;">
+                        <button type="button" id="previewSpintaxBtn" class="btn btn-small">Превью спинтакса</button>
+                    </div>
+                    <div id="spintaxPreview" class="muted-text" style="margin-top: 8px;"></div>
+                </div>
+
+                <div class="form-row-templates">
+                    <input type="text" id="templateName" placeholder="Название шаблона" class="form-control">
+                    <button id="saveTemplateBtn" class="btn btn-small">Сохранить шаблон</button>
+                </div>
+                <div class="templates-list" id="templatesList"></div>
+
+                <div class="section-divider"></div>
+                <h3 class="sub-title">Расписание</h3>
+                <div class="form-row-4">
+                    <div class="form-group">
+                        <label>Начало</label>
+                        <input type="time" id="scheduleStartTime" value="10:00" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label>Конец</label>
+                        <input type="time" id="scheduleEndTime" value="20:00" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label>Лимит в час</label>
+                        <input type="number" id="hourlyLimit" value="10" min="1" max="200" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label>Дни</label>
+                        <select id="scheduleDays" multiple class="form-control" size="3">
+                            <option value="1" selected>Пн</option>
+                            <option value="2" selected>Вт</option>
+                            <option value="3" selected>Ср</option>
+                            <option value="4" selected>Чт</option>
+                            <option value="5" selected>Пт</option>
+                            <option value="6">Сб</option>
+                            <option value="0">Вс</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Считать игнором через (часы без ответа)</label>
+                    <input type="number" id="ignoreAfterHours" value="24" min="1" max="720" class="form-control">
+                </div>
+
+                <div class="section-divider"></div>
+                <div class="panel-head">
+                    <h3 class="sub-title" style="margin: 0;">Цепочка фоллоуапов</h3>
+                    <button id="addFollowupStepBtn" class="btn btn-small">+ Шаг</button>
+                </div>
+                <div id="followupSteps" class="followup-steps"></div>
+
+                <div class="section-divider"></div>
+                <div class="panel-head">
+                    <h3 class="sub-title" style="margin: 0;">База контактов</h3>
+                    <div id="uploadProgress" class="muted-text"></div>
+                </div>
+                <div class="muted-text" style="margin-bottom: 8px; font-size: 12px;">
+                    Формат файла: минимум одна из колонок <code>user_id</code>/<code>username</code>/<code>phone</code>.
+                    Дополнительно можно <code>name</code>, <code>company</code>, <code>position</code>.
+                </div>
+                <div class="upload-area" id="uploadArea">
+                    <div>Перетащите файл сюда или нажмите для выбора</div>
+                    <small>CSV/Excel: <code>user_id</code>, <code>username</code> или <code>phone</code></small>
+                </div>
+                <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" style="display:none">
+
+                <div class="section-divider"></div>
+                <div class="btn-group wrap">
+                    <button id="saveCampaignBtn" class="btn btn-primary">Сохранить настройки</button>
+                    <button id="startCampaignBtn" class="btn btn-success" disabled>Запустить</button>
+                    <button id="pauseCampaignBtn" class="btn" disabled>Пауза</button>
+                    <button id="stopCampaignBtn" class="btn btn-danger" disabled>Остановить</button>
+                </div>
+                <div id="runStatus" class="muted-text" style="margin-top: 10px;"></div>
+                <div id="readinessStatus" class="muted-text" style="margin-top: 6px;"></div>
+            </div>
+        </div>
+
+        <div style="margin-top: 24px;">
+            <div class="panel-head" style="margin-bottom: 8px;">
+                <h2 class="section-title" style="margin:0;">Черный список user_id</h2>
+                <div class="btn-group">
+                    <input id="blacklistUserIdInput" type="number" class="form-control" placeholder="user_id" style="max-width: 160px;">
+                    <button id="addBlacklistBtn" class="btn btn-small">Добавить</button>
+                </div>
+            </div>
+            <div id="blacklistList" class="templates-list" style="margin-bottom: 18px;"></div>
+
+            <h2 class="section-title">Контакты кампании</h2>
+            <div class="btn-group" style="margin-bottom: 8px;">
+                <button id="exportStepReportCsvBtn" class="btn btn-small">Экспорт отчета шагов CSV</button>
+                <button id="exportStepReportXlsxBtn" class="btn btn-small">Экспорт отчета шагов XLSX</button>
+            </div>
+            <div class="table-container contacts-table-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Статус</th>
+                            <th>Контакт</th>
+                            <th>Шаг</th>
+                            <th>Компания</th>
+                            <th>Аккаунт</th>
+                            <th>Примечание</th>
+                            <th>Действия</th>
+                        </tr>
+                    </thead>
+                    <tbody id="contactsList">
+                        <tr><td colspan="7" style="text-align:center; padding: 30px;">Выберите кампанию</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="contactsStats" class="muted-text" style="margin-top: 10px;"></div>
+        </div>
+    </div>
+
+    <script src="/static/outreach.js"></script>
+</body>
+</html>
