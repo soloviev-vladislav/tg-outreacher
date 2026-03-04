@@ -6,6 +6,8 @@ let templates = [];
 let refreshTimer = null;
 let blacklistRows = [];
 let blacklistSet = new Set();
+let contactsPage = 1;
+const CONTACTS_PAGE_SIZE = 100;
 
 const SELECTED_CAMPAIGN_KEY = 'outreach_selected_campaign_id';
 
@@ -25,6 +27,9 @@ function setupEventListeners() {
     document.getElementById('startCampaignBtn')?.addEventListener('click', () => currentCampaignId && startCampaign(currentCampaignId));
     document.getElementById('pauseCampaignBtn')?.addEventListener('click', () => currentCampaignId && pauseCampaign(currentCampaignId));
     document.getElementById('stopCampaignBtn')?.addEventListener('click', () => currentCampaignId && stopCampaign(currentCampaignId));
+    document.getElementById('deleteCampaignBtn')?.addEventListener('click', () => currentCampaignId && deleteCampaign(currentCampaignId));
+    document.getElementById('selectAllCampaignAccountsBtn')?.addEventListener('click', selectAllCampaignAccounts);
+    document.getElementById('clearCampaignAccountsBtn')?.addEventListener('click', clearCampaignAccounts);
 
     document.getElementById('addFollowupStepBtn')?.addEventListener('click', () => addFollowupStep());
     document.getElementById('addBlacklistBtn')?.addEventListener('click', addBlacklistFromInput);
@@ -313,6 +318,7 @@ function restoreSelectedCampaign() {
 
 async function selectCampaign(campaignId) {
     currentCampaignId = campaignId;
+    contactsPage = 1;
     localStorage.setItem(SELECTED_CAMPAIGN_KEY, String(campaignId));
 
     await loadCampaigns();
@@ -332,6 +338,7 @@ async function selectCampaign(campaignId) {
 
 function newCampaign() {
     currentCampaignId = null;
+    contactsPage = 1;
     localStorage.removeItem(SELECTED_CAMPAIGN_KEY);
 
     document.getElementById('campaignName').value = '';
@@ -362,8 +369,11 @@ function newCampaign() {
     document.getElementById('startCampaignBtn').disabled = true;
     document.getElementById('pauseCampaignBtn').disabled = true;
     document.getElementById('stopCampaignBtn').disabled = true;
+    document.getElementById('deleteCampaignBtn').disabled = true;
 
     document.getElementById('contactsList').innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">Сначала сохраните кампанию</td></tr>';
+    const pagination = document.getElementById('contactsPagination');
+    if (pagination) pagination.innerHTML = '';
     document.getElementById('contactsStats').textContent = '';
     document.getElementById('readinessStatus').textContent = '';
     document.getElementById('runStatus').textContent = '';
@@ -411,6 +421,19 @@ function updateActionButtons(status) {
     document.getElementById('startCampaignBtn').disabled = !hasCampaign || st === 'active';
     document.getElementById('pauseCampaignBtn').disabled = !hasCampaign || st !== 'active';
     document.getElementById('stopCampaignBtn').disabled = !hasCampaign || st === 'stopped' || st === 'draft';
+    document.getElementById('deleteCampaignBtn').disabled = !hasCampaign;
+}
+
+function selectAllCampaignAccounts() {
+    accounts.forEach(a => {
+        if (a?.phone) selectedCampaignAccounts.add(String(a.phone));
+    });
+    renderCampaignAccountsSelector();
+}
+
+function clearCampaignAccounts() {
+    selectedCampaignAccounts.clear();
+    renderCampaignAccountsSelector();
 }
 
 function addFollowupStep(step = null) {
@@ -426,7 +449,8 @@ function addFollowupStep(step = null) {
         <div class="followup-step-grid">
             <div>
                 <label class="followup-step-title">Фоллоуап</label>
-                <textarea class="followup-content" rows="3" placeholder="Напоминание / дополнительная ценность...">${escapeHtml(content)}</textarea>
+                <textarea class="followup-content" rows="3" placeholder="Привет, {name}! {Напоминаю|Возвращаюсь} по теме...">${escapeHtml(content)}</textarea>
+                <div class="variables-hint" style="margin-top:6px;">Переменные: {name} {company} {position} {phone}. Спинтакс: {вариант1|вариант2}</div>
             </div>
             <div class="followup-actions">
                 <button type="button" class="btn btn-small followup-up">↑</button>
@@ -537,8 +561,8 @@ async function saveCampaign() {
         showSaveStatus('Введите текст первого сообщения', true);
         return;
     }
-    if (!payload.accounts.length) {
-        showSaveStatus('Выберите минимум один outreach-аккаунт', true);
+    if (!currentCampaignId && !payload.accounts.length) {
+        showSaveStatus('Для новой кампании выберите минимум один outreach-аккаунт', true);
         return;
     }
     if (payload.delayMax < payload.delayMin) {
@@ -653,14 +677,32 @@ async function uploadFile(file) {
 }
 
 async function loadContacts(campaignId) {
-    const response = await fetch(`/api/outreach/campaign/${campaignId}/contacts?limit=100`);
-    const contacts = await response.json();
+    const offset = Math.max(0, (contactsPage - 1) * CONTACTS_PAGE_SIZE);
+    const response = await fetch(`/api/outreach/campaign/${campaignId}/contacts?limit=${CONTACTS_PAGE_SIZE}&offset=${offset}`);
+    const data = await response.json();
+    const contacts = Array.isArray(data) ? data : (Array.isArray(data.items) ? data.items : []);
+    const total = Array.isArray(data) ? contacts.length : Number(data.total || 0);
+    const statusCounts = Array.isArray(data)
+        ? {
+            new: contacts.filter(c => c.status === 'new').length,
+            sent: contacts.filter(c => c.status === 'sent').length,
+            ignored: contacts.filter(c => c.status === 'ignored').length,
+            replied: contacts.filter(c => c.status === 'replied').length,
+            failed: contacts.filter(c => c.status === 'failed').length
+        }
+        : (data.status_counts || { new: 0, sent: 0, ignored: 0, replied: 0, failed: 0 });
     const campaign = campaigns.find(c => c.id === campaignId);
 
     const tbody = document.getElementById('contactsList');
+    if (total > 0 && contacts.length === 0 && contactsPage > 1) {
+        contactsPage = Math.max(1, Math.ceil(total / CONTACTS_PAGE_SIZE));
+        return loadContacts(campaignId);
+    }
     if (!Array.isArray(contacts) || contacts.length === 0) {
         tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">Контактов пока нет</td></tr>';
-        document.getElementById('contactsStats').textContent = 'Контактов: 0';
+        document.getElementById('contactsStats').textContent =
+            `Всего ${total} · new ${Number(statusCounts.new || 0)} · sent ${Number(statusCounts.sent || 0)} · ignored ${Number(statusCounts.ignored || 0)} · replied ${Number(statusCounts.replied || 0)} · failed ${Number(statusCounts.failed || 0)}`;
+        renderContactsPagination(total);
         return;
     }
 
@@ -702,15 +744,42 @@ async function loadContacts(campaignId) {
             await Promise.all([loadBlacklist(), loadContacts(campaignId)]);
         });
     });
-
-    const newCount = contacts.filter(c => c.status === 'new').length;
-    const sentCount = contacts.filter(c => c.status === 'sent').length;
-    const ignoredCount = contacts.filter(c => c.status === 'ignored').length;
-    const repliedCount = contacts.filter(c => c.status === 'replied').length;
-    const failedCount = contacts.filter(c => c.status === 'failed').length;
+    renderContactsPagination(total);
 
     document.getElementById('contactsStats').textContent =
-        `Всего ${contacts.length} · new ${newCount} · sent ${sentCount} · ignored ${ignoredCount} · replied ${repliedCount} · failed ${failedCount}`;
+        `Всего ${total} · new ${Number(statusCounts.new || 0)} · sent ${Number(statusCounts.sent || 0)} · ignored ${Number(statusCounts.ignored || 0)} · replied ${Number(statusCounts.replied || 0)} · failed ${Number(statusCounts.failed || 0)}`;
+}
+
+function renderContactsPagination(total) {
+    const wrap = document.getElementById('contactsPagination');
+    if (!wrap) return;
+    const pages = Math.max(1, Math.ceil((Number(total) || 0) / CONTACTS_PAGE_SIZE));
+    if (contactsPage > pages) contactsPage = pages;
+    const start = total > 0 ? ((contactsPage - 1) * CONTACTS_PAGE_SIZE) + 1 : 0;
+    const end = Math.min(contactsPage * CONTACTS_PAGE_SIZE, Number(total) || 0);
+
+    wrap.innerHTML = `
+        <button type="button" class="btn btn-small" id="contactsPrevPage" ${contactsPage <= 1 ? 'disabled' : ''}>← Назад</button>
+        <small class="muted-text">Стр. ${contactsPage}/${pages} · показано ${start}-${end}</small>
+        <button type="button" class="btn btn-small" id="contactsNextPage" ${contactsPage >= pages ? 'disabled' : ''}>Вперёд →</button>
+    `;
+
+    const prevBtn = document.getElementById('contactsPrevPage');
+    const nextBtn = document.getElementById('contactsNextPage');
+    if (prevBtn) {
+        prevBtn.addEventListener('click', async () => {
+            if (contactsPage <= 1 || !currentCampaignId) return;
+            contactsPage -= 1;
+            await loadContacts(currentCampaignId);
+        });
+    }
+    if (nextBtn) {
+        nextBtn.addEventListener('click', async () => {
+            if (contactsPage >= pages || !currentCampaignId) return;
+            contactsPage += 1;
+            await loadContacts(currentCampaignId);
+        });
+    }
 }
 
 function getOrderedFollowupStepIds(campaign) {
@@ -793,6 +862,21 @@ async function stopCampaign(id) {
     showSaveStatus('Кампания остановлена');
     await Promise.all([loadCampaigns(), refreshReadiness(id)]);
     await selectCampaign(id);
+}
+
+async function deleteCampaign(id) {
+    if (!confirm('Удалить кампанию и все ее контакты/историю отправок?')) return;
+    const response = await fetch(`/api/outreach/campaign/${id}`, { method: 'DELETE' });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        showSaveStatus(data.error || 'Ошибка удаления кампании', true);
+        return;
+    }
+    showSaveStatus('Кампания удалена');
+    currentCampaignId = null;
+    localStorage.removeItem(SELECTED_CAMPAIGN_KEY);
+    await loadCampaigns();
+    restoreSelectedCampaign();
 }
 
 function escapeHtml(value) {

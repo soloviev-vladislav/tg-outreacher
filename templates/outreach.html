@@ -54,6 +54,10 @@
 
                 <div class="form-group">
                     <label>Аккаунты для отправки (только outreach)</label>
+                    <div class="btn-group" style="margin-bottom: 8px;">
+                        <button id="selectAllCampaignAccountsBtn" class="btn btn-small" type="button">Выбрать все</button>
+                        <button id="clearCampaignAccountsBtn" class="btn btn-small" type="button">Снять все</button>
+                    </div>
                     <div id="campaignAccountsList" class="account-checklist"></div>
                     <div id="campaignAccountsSummary" class="muted-text" style="margin-top: 8px;"></div>
                     <small class="form-hint">Если выбрано несколько аккаунтов, сообщения отправляются по ротации (карусель).</small>
@@ -128,6 +132,10 @@
                     <h3 class="sub-title" style="margin: 0;">Цепочка фоллоуапов</h3>
                     <button id="addFollowupStepBtn" class="btn btn-small">+ Шаг</button>
                 </div>
+                <div class="muted-text" style="margin-bottom: 8px; font-size: 12px;">
+                    В фоллоуапах работают переменные <code>{name}</code> <code>{company}</code> <code>{position}</code> <code>{phone}</code>
+                    и спинтакс вида <code>{вариант1|вариант2}</code>.
+                </div>
                 <div id="followupSteps" class="followup-steps"></div>
 
                 <div class="section-divider"></div>
@@ -151,6 +159,7 @@
                     <button id="startCampaignBtn" class="btn btn-success" disabled>Запустить</button>
                     <button id="pauseCampaignBtn" class="btn" disabled>Пауза</button>
                     <button id="stopCampaignBtn" class="btn btn-danger" disabled>Остановить</button>
+                    <button id="deleteCampaignBtn" class="btn btn-danger" disabled>Удалить кампанию</button>
                 </div>
                 <div id="runStatus" class="muted-text" style="margin-top: 10px;"></div>
                 <div id="readinessStatus" class="muted-text" style="margin-top: 6px;"></div>
@@ -190,6 +199,7 @@
                     </tbody>
                 </table>
             </div>
+            <div id="contactsPagination" class="btn-group" style="margin-top: 8px; gap: 8px;"></div>
             <div id="contactsStats" class="muted-text" style="margin-top: 10px;"></div>
         </div>
     </div>

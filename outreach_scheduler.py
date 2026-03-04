@@ -5,7 +5,7 @@ import json
 import random
 import os
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
 from telethon import TelegramClient, errors
 from telethon.tl.functions.contacts import ImportContactsRequest
@@ -139,6 +139,7 @@ class OutreachScheduler:
     WARM_PARTICIPANTS_LIMIT = 3000
     WARM_MESSAGES_LIMIT = 800
     CAMPAIGN_LOCK_TTL_MINUTES = 10
+    FOLLOWUP_MIN_INTERVAL_SECONDS = 120
     
     def __init__(self, db_path='checker.db', sessions_dir='sessions'):
         self.db = Database(db_path)
@@ -154,6 +155,8 @@ class OutreachScheduler:
         self.deep_warm_attempted = set()
         self.lock_owner = str(uuid.uuid4())
         self.rng = random.SystemRandom()
+        # account_phone -> datetime когда можно отправить следующий фоллоуап
+        self.followup_next_allowed_at = {}
 
     def _read_env_file_value(self, key: str) -> str:
         env_path = '.env'
@@ -222,6 +225,73 @@ class OutreachScheduler:
         self.target_chat_warm_state.clear()
         self.contact_card_index.clear()
         self.deep_warm_attempted.clear()
+        self.followup_next_allowed_at.clear()
+
+    def _get_followup_min_interval_seconds(self) -> int:
+        value = os.getenv('FOLLOWUP_MIN_INTERVAL_SECONDS', '').strip()
+        if value:
+            try:
+                return max(0, int(value))
+            except ValueError:
+                pass
+        return self.FOLLOWUP_MIN_INTERVAL_SECONDS
+
+    @staticmethod
+    def _parse_db_datetime(value) -> Optional[datetime]:
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            try:
+                return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+
+    def _get_followup_wait_seconds(self, account_phone: str) -> int:
+        """
+        Минимальный интервал между фоллоуапами с одного аккаунта.
+        Проверяем сначала in-memory таймер, затем БД (на случай рестарта процесса).
+        """
+        min_interval = self._get_followup_min_interval_seconds()
+        if min_interval <= 0:
+            return 0
+
+        now = datetime.now()
+        cached_next = self.followup_next_allowed_at.get(account_phone)
+        if cached_next and cached_next > now:
+            return int((cached_next - now).total_seconds())
+
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT MAX(c.sent_at)
+                FROM conversations c
+                JOIN outreach_contacts oc ON oc.id = c.contact_id
+                WHERE c.direction = 'outgoing'
+                  AND COALESCE(c.is_followup, 0) = 1
+                  AND oc.account_used = ?
+            ''', (account_phone,))
+            row = cursor.fetchone()
+
+        last_sent_at = self._parse_db_datetime(row[0] if row else None)
+        if not last_sent_at:
+            return 0
+
+        next_allowed = last_sent_at + timedelta(seconds=min_interval)
+        self.followup_next_allowed_at[account_phone] = next_allowed
+        if next_allowed <= now:
+            return 0
+        return int((next_allowed - now).total_seconds())
+
+    def _mark_followup_sent_now(self, account_phone: str):
+        min_interval = self._get_followup_min_interval_seconds()
+        if min_interval <= 0:
+            return
+        self.followup_next_allowed_at[account_phone] = datetime.now() + timedelta(seconds=min_interval)
 
     def _get_target_chat(self) -> Optional[str]:
         form_data = self.db.load_form_data()
@@ -438,12 +508,17 @@ class OutreachScheduler:
         return now_t >= start_t or now_t <= end_t
 
     def _remaining_slots(self, campaign: Dict) -> int:
+        """
+        Лимиты кампании (day/hour) применяются только к первичным сообщениям.
+        Фоллоуапы не расходуют эти слоты.
+        """
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
 
             cursor.execute('''
                 SELECT COUNT(*) FROM conversations
                 WHERE campaign_id = ? AND direction = 'outgoing'
+                  AND COALESCE(is_followup, 0) = 0
                   AND date(sent_at) = date('now')
             ''', (campaign['id'],))
             sent_today = cursor.fetchone()[0] or 0
@@ -451,6 +526,7 @@ class OutreachScheduler:
             cursor.execute('''
                 SELECT COUNT(*) FROM conversations
                 WHERE campaign_id = ? AND direction = 'outgoing'
+                  AND COALESCE(is_followup, 0) = 0
                   AND datetime(sent_at) >= datetime('now', '-1 hour')
             ''', (campaign['id'],))
             sent_last_hour = cursor.fetchone()[0] or 0
@@ -558,17 +634,13 @@ class OutreachScheduler:
             logger.info(f"Campaign {campaign['id']} skipped by schedule window")
             return
 
-        slots_left = self._remaining_slots(campaign)
-        if slots_left <= 0:
-            logger.info(f"Campaign {campaign['id']} has no available slots")
-            return
-        
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
 
             # Получаем контакты для фолоуапов
             cursor.execute('''
                 SELECT oc.id, oc.phone, oc.name, oc.company, oc.position, oc.user_id, oc.username, oc.access_hash,
+                       oc.account_used,
                        MAX(m.sent_at) as last_message
                 FROM outreach_contacts oc
                 LEFT JOIN conversations m ON oc.id = m.contact_id
@@ -581,32 +653,40 @@ class OutreachScheduler:
                       WHERE contact_id = oc.id AND direction = 'incoming'
                   )
                 GROUP BY oc.id
-                LIMIT ?
-            ''', (campaign['id'], slots_left))
+                LIMIT 500
+            ''', (campaign['id'],))
             followup_contacts = cursor.fetchall()
         followup_candidates = len(followup_contacts)
         followup_sent = 0
 
-        # Сначала отправляем фолоуапы, затем новые сообщения.
+        # Сначала отправляем фолоуапы (они НЕ учитываются в лимитах отправки),
+        # затем первичные сообщения в рамках дневных/часовых лимитов кампании.
         for contact in followup_contacts:
             if not self._is_campaign_active(campaign['id']):
                 logger.info(f"Campaign {campaign['id']} paused/stopped during followup batch")
                 return
-            if slots_left <= 0:
-                break
+            account_used = contact[8] if len(contact) > 8 else None
+            if account_used:
+                wait_left = self._get_followup_wait_seconds(account_used)
+                if wait_left > 0:
+                    continue
             ordered_accounts = self._get_rotated_accounts(
                 campaign['id'],
-                await self._get_campaign_accounts(campaign)
+                await self._get_campaign_accounts(campaign, respect_daily_limits=False)
             )
             sent_ok = await self.send_followup(campaign, contact, ordered_accounts)
             if sent_ok:
-                slots_left -= 1
                 followup_sent += 1
-                delay_seconds = self._pick_delay_seconds(campaign)
-                if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
+                # Важный момент: фоллоуапы не должны задерживать первичные отправки.
+                # Поэтому паузу здесь не делаем.
 
+        slots_left = self._remaining_slots(campaign)
         if slots_left <= 0:
+            logger.info(f"Campaign {campaign['id']} has no available initial-message slots")
+            logger.info(
+                f"Campaign {campaign['id']} summary: blacklisted_blocked={blacklisted_blocked}, ignored_marked={ignored_marked}, "
+                f"followup={followup_sent}/{followup_candidates}, new=0/0, slots_left={slots_left}"
+            )
             return
 
         with sqlite3.connect(self.db.db_path) as conn:
@@ -670,6 +750,38 @@ class OutreachScheduler:
             cursor = conn.cursor()
             cursor.execute('SELECT 1 FROM outreach_blacklist WHERE user_id = ?', (uid,))
             return cursor.fetchone() is not None
+
+    @staticmethod
+    def _is_spam_limit_error(exc: Exception) -> bool:
+        """Определяет ошибки антиспама/лимитов, при которых нужен прогрев через @SpamBot."""
+        if isinstance(exc, errors.FloodWaitError):
+            return True
+        name = type(exc).__name__.lower()
+        text = str(exc).lower()
+        spam_markers = (
+            'peerflood',
+            'peer_flood',
+            'flood',
+            'too many requests',
+            'retry after',
+            'a wait of'
+        )
+        return any(marker in name or marker in text for marker in spam_markers)
+
+    async def _run_spambot_recovery(self, account_phone: str, client) -> bool:
+        """
+        Пытается снять ограничение отправки:
+        1) отправляет /start в @SpamBot
+        2) ждёт 90 секунд
+        """
+        try:
+            await client.send_message('@SpamBot', '/start')
+            logger.warning(f"[{account_phone}] spam-limit detected, sent /start to @SpamBot, waiting 90s before retry")
+            await asyncio.sleep(90)
+            return True
+        except Exception as e:
+            logger.error(f"[{account_phone}] failed to run SpamBot recovery: {e}")
+            return False
 
     def _mark_ignored_contacts(self, campaign: Dict):
         """
@@ -874,8 +986,11 @@ class OutreachScheduler:
         self.accounts_cache[account_phone] = (client, stats)
         return client, stats
 
-    async def _get_campaign_accounts(self, campaign: Dict):
-        """Доступные аккаунты кампании: только выбранные outreach, в порядке выбора."""
+    async def _get_campaign_accounts(self, campaign: Dict, respect_daily_limits: bool = True):
+        """
+        Доступные аккаунты кампании: только выбранные outreach, в порядке выбора.
+        respect_daily_limits=False используется для фоллоуапов, чтобы не расходовать/не ограничивать их дневным лимитом.
+        """
         selected = campaign.get('accounts') or []
         if not selected:
             return []
@@ -903,8 +1018,19 @@ class OutreachScheduler:
             if account_type != 'outreach' or is_banned or is_frozen:
                 continue
             client, stats = await self.get_account_client(phone)
-            if client and stats and stats.can_use_today():
-                available.append((phone, client, stats))
+            if not client or not stats:
+                continue
+            # Если наступил новый день, can_use_today() обнулит счётчики только в памяти.
+            # Сразу сохраняем это в БД, чтобы UI показывал корректный today.
+            before_date = stats.last_check_date
+            before_checked = stats.checked_today
+            can_use = stats.can_use_today()
+            if stats.last_check_date != before_date or stats.checked_today != before_checked:
+                self._persist_account_usage(stats)
+
+            if respect_daily_limits and not can_use:
+                continue
+            available.append((phone, client, stats))
         return available
 
     def _get_rotated_accounts(self, campaign_id: int, accounts: List[tuple]) -> List[tuple]:
@@ -1349,60 +1475,69 @@ class OutreachScheduler:
         attempt_errors = []
 
         for account_phone, client, stats in available_accounts:
-            try:
-                await self._warm_entities_from_target_chat(account_phone, client)
-                route = await self._send_with_target_chat_retry(
-                    account_phone=account_phone,
-                    client=client,
-                    message=message,
-                    user_id=user_id,
-                    username=username,
-                    phone=phone,
-                    name=name
-                )
+            spam_recovery_used = False
+            while True:
+                try:
+                    await self._warm_entities_from_target_chat(account_phone, client)
+                    route = await self._send_with_target_chat_retry(
+                        account_phone=account_phone,
+                        client=client,
+                        message=message,
+                        user_id=user_id,
+                        username=username,
+                        phone=phone,
+                        name=name
+                    )
 
-                stats.increment_checked(is_test=False)
-                self._persist_account_usage(stats)
+                    # Первичные сообщения расходуют лимит аккаунта outreach.
+                    stats.increment_checked(is_test=False)
+                    self._persist_account_usage(stats)
 
-                status_changed = self._transition_contact_status(
-                    contact_id=contact_id,
-                    new_status='sent',
-                    allowed_from=['new'],
-                    extra_updates={
-                        'message_sent_at': datetime.now().isoformat(),
-                        'account_used': account_phone,
-                        'last_message': message,
-                        'notes': None
-                    }
-                )
-                if not status_changed:
-                    logger.warning(f"Contact {contact_id} status changed concurrently, skip duplicate initial send record")
-                    return False
+                    status_changed = self._transition_contact_status(
+                        contact_id=contact_id,
+                        new_status='sent',
+                        allowed_from=['new'],
+                        extra_updates={
+                            'message_sent_at': datetime.now().isoformat(),
+                            'account_used': account_phone,
+                            'last_message': message,
+                            'notes': None
+                        }
+                    )
+                    if not status_changed:
+                        logger.warning(f"Contact {contact_id} status changed concurrently, skip duplicate initial send record")
+                        return False
 
-                with sqlite3.connect(self.db.db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO conversations 
-                        (campaign_id, contact_id, direction, content, step_id)
-                        VALUES (?, ?, 'outgoing', ?, 1)
-                    ''', (campaign['id'], contact_id, message))
+                    with sqlite3.connect(self.db.db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO conversations 
+                            (campaign_id, contact_id, direction, content, step_id)
+                            VALUES (?, ?, 'outgoing', ?, 1)
+                        ''', (campaign['id'], contact_id, message))
 
-                    cursor.execute('''
-                        UPDATE outreach_campaigns 
-                        SET sent_count = sent_count + 1
-                        WHERE id = ?
-                    ''', (campaign['id'],))
+                        cursor.execute('''
+                            UPDATE outreach_campaigns 
+                            SET sent_count = sent_count + 1
+                            WHERE id = ?
+                        ''', (campaign['id'],))
 
-                    conn.commit()
+                        conn.commit()
 
-                logger.info(f"✅ Message sent to user {user_id} using {account_phone} via {route}")
-                return True
+                    logger.info(f"✅ Message sent to user {user_id} using {account_phone} via {route}")
+                    return True
 
-            except Exception as e:
-                last_error = e
-                attempt_errors.append(f"{account_phone}:{type(e).__name__}:{e}")
-                logger.error(f"Error sending message to user {user_id} via {account_phone}: {e}")
-                continue
+                except Exception as e:
+                    if self._is_spam_limit_error(e) and not spam_recovery_used:
+                        recovered = await self._run_spambot_recovery(account_phone, client)
+                        spam_recovery_used = True
+                        if recovered:
+                            logger.info(f"[{account_phone}] retrying send after SpamBot recovery")
+                            continue
+                    last_error = e
+                    attempt_errors.append(f"{account_phone}:{type(e).__name__}:{e}")
+                    logger.error(f"Error sending message to user {user_id} via {account_phone}: {e}")
+                    break
 
         notes_text = str(last_error)[:500] if last_error else 'unknown_error'
         if attempt_errors:
@@ -1418,8 +1553,8 @@ class OutreachScheduler:
     
     async def send_followup(self, campaign: Dict, contact: tuple, ordered_accounts: Optional[List[tuple]] = None):
         """Отправка фолоуапа"""
-        # contact: (id, phone, name, company, position, user_id, username, access_hash, last_message)
-        contact_id, phone, name, company, position, user_id, username, access_hash, last_message = contact
+        # contact: (id, phone, name, company, position, user_id, username, access_hash, account_used, last_message)
+        contact_id, phone, name, company, position, user_id, username, access_hash, account_used, last_message = contact
         
         if not user_id and not username and not phone:
             logger.warning(f"Contact {contact_id} has no user_id/username/phone, skipping followup")
@@ -1477,58 +1612,88 @@ class OutreachScheduler:
             phone=phone
         )
         
-        available_accounts = ordered_accounts if ordered_accounts is not None else await self._get_campaign_accounts(campaign)
+        available_accounts = (
+            ordered_accounts
+            if ordered_accounts is not None
+            else await self._get_campaign_accounts(campaign, respect_daily_limits=False)
+        )
+        # Фоллоуап должен идти строго с того же аккаунта, который отправлял первичное сообщение.
+        if account_used:
+            available_accounts = [a for a in available_accounts if a[0] == account_used]
+        else:
+            logger.warning(f"Followup skipped for contact {contact_id}: no account_used from initial message")
+            return False
+
         if not available_accounts:
-            logger.warning(f"No available accounts for followup campaign {campaign['name']}")
+            logger.warning(
+                f"No available account for followup contact {contact_id}: required account {account_used}"
+            )
+            return False
+
+        wait_left = self._get_followup_wait_seconds(account_used)
+        if wait_left > 0:
+            logger.info(
+                f"Followup throttled for account {account_used}: wait {wait_left}s"
+            )
             return False
 
         last_error = None
         for account_phone, client, stats in available_accounts:
-            if not client or not stats.can_use_today():
+            if not client:
                 continue
-            try:
-                await self._warm_entities_from_target_chat(account_phone, client)
-                route = await self._send_with_target_chat_retry(
-                    account_phone=account_phone,
-                    client=client,
-                    message=message,
-                    user_id=user_id,
-                    username=username,
-                    phone=phone,
-                    name=name
-                )
-                stats.increment_checked(is_test=False)
-                self._persist_account_usage(stats)
+            spam_recovery_used = False
+            while True:
+                try:
+                    await self._warm_entities_from_target_chat(account_phone, client)
+                    route = await self._send_with_target_chat_retry(
+                        account_phone=account_phone,
+                        client=client,
+                        message=message,
+                        user_id=user_id,
+                        username=username,
+                        phone=phone,
+                        name=name
+                    )
+                    # Фоллоуапы не должны расходовать лимиты аккаунта outreach.
+                    self._persist_account_usage(stats)
 
-                status_changed = self._transition_contact_status(
-                    contact_id=contact_id,
-                    new_status='sent',
-                    allowed_from=['ignored'],
-                    extra_updates={
-                        'last_message': message,
-                        'message_sent_at': datetime.now().isoformat(),
-                        'account_used': account_phone
-                    }
-                )
-                if not status_changed:
-                    logger.warning(f"Contact {contact_id} status changed concurrently, skip duplicate followup record")
-                    return False
-                
-                with sqlite3.connect(self.db.db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO conversations 
-                        (campaign_id, contact_id, direction, content, step_id, is_followup)
-                        VALUES (?, ?, 'outgoing', ?, ?, TRUE)
-                    ''', (campaign['id'], contact_id, message, next_step['id']))
+                    status_changed = self._transition_contact_status(
+                        contact_id=contact_id,
+                        new_status='sent',
+                        allowed_from=['ignored'],
+                        extra_updates={
+                            'last_message': message,
+                            'message_sent_at': datetime.now().isoformat()
+                        }
+                    )
+                    if not status_changed:
+                        logger.warning(f"Contact {contact_id} status changed concurrently, skip duplicate followup record")
+                        return False
                     
-                    conn.commit()
-                
-                logger.info(f"✅ Followup sent to user {user_id} via {route} using {account_phone}")
-                return True
-            except Exception as e:
-                last_error = e
-                logger.error(f"Error sending followup to user {user_id} via {account_phone}: {e}")
+                    with sqlite3.connect(self.db.db_path) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO conversations 
+                            (campaign_id, contact_id, direction, content, step_id, is_followup)
+                            VALUES (?, ?, 'outgoing', ?, ?, TRUE)
+                        ''', (campaign['id'], contact_id, message, next_step['id']))
+                        
+                        conn.commit()
+
+                    self._mark_followup_sent_now(account_phone)
+                    
+                    logger.info(f"✅ Followup sent to user {user_id} via {route} using {account_phone}")
+                    return True
+                except Exception as e:
+                    if self._is_spam_limit_error(e) and not spam_recovery_used:
+                        recovered = await self._run_spambot_recovery(account_phone, client)
+                        spam_recovery_used = True
+                        if recovered:
+                            logger.info(f"[{account_phone}] retrying followup after SpamBot recovery")
+                            continue
+                    last_error = e
+                    logger.error(f"Error sending followup to user {user_id} via {account_phone}: {e}")
+                    break
 
         if last_error:
             self._transition_contact_status(

@@ -42,12 +42,16 @@
             <input type="file" id="sessionFileInput" accept=".session" style="display:none;" onchange="uploadSessionFile(event)">
             <button class="btn btn-success" onclick="testAllAccounts()">Тестировать все</button>
             <button class="btn" onclick="assignProxies()" id="assignProxiesBtn">Назначить прокси</button>
+            <button class="btn" onclick="unassignProxies()" id="unassignProxiesBtn">Отключить прокси</button>
             <button class="btn btn-warning" onclick="changeAccountType()" id="changeTypeBtn">Изменить тип</button>
+            <button class="btn btn-danger" onclick="deleteSelectedAccounts()" id="deleteAccountsBtn">Удалить аккаунты</button>
         </div>
 
         <div class="grid-2" style="margin-bottom:20px;">
             <input type="text" id="searchInput" placeholder="🔍 Поиск по телефону..." class="form-control">
             <div style="display:flex; gap:10px;">
+                <button class="btn btn-small" onclick="selectFilteredAccounts()">Выделить все (фильтр)</button>
+                <button class="btn btn-small" onclick="clearSelection()">Снять выделение</button>
                 <select id="typeFilter" class="form-control">
                     <option value="">Все типы</option>
                     <option value="checker">Checker</option>
@@ -153,18 +157,7 @@
 
         function updateTable() {
             const tbody = document.getElementById('accountsTableBody');
-            const search = document.getElementById('searchInput').value.toLowerCase();
-            const type = document.getElementById('typeFilter').value;
-            const status = document.getElementById('statusFilter').value;
-
-            const filtered = accounts.filter(a => {
-                if (search && !a.phone?.toLowerCase().includes(search)) return false;
-                if (type && a.account_type !== type) return false;
-                if (status === 'active' && (a.is_banned || a.is_frozen)) return false;
-                if (status === 'banned' && !a.is_banned) return false;
-                if (status === 'frozen' && !a.is_frozen) return false;
-                return true;
-            });
+            const filtered = getFilteredAccounts();
 
             if (filtered.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding:40px;">Нет аккаунтов</td></tr>';
@@ -191,6 +184,8 @@
                     <td>${a.proxy_id ? '✅' : '❌'}</td>
                     <td onclick="event.stopPropagation()">
                         <button class="btn btn-small" onclick="testAccount('${a.phone}')">Тест</button>
+                        <button class="btn btn-small" onclick="toggleProxy('${a.phone}', ${a.proxy_id ? 1 : 0})">${a.proxy_id ? 'Откл. прокси' : 'Назн. прокси'}</button>
+                        <button class="btn btn-small btn-danger" onclick="deleteSingleAccount('${a.phone}')">Удалить</button>
                         ${a.account_type === 'outreach' ? `<button class="btn btn-small" onclick="setOutreachLimit('${a.phone}', ${a.outreach_daily_limit || 20})">Лимит</button>` : ''}
                     </td>
                 </tr>
@@ -249,23 +244,50 @@
         function updateSelectAllCheckbox() {
             const selectAll = document.getElementById('selectAll');
             if (selectAll) {
-                selectAll.checked = selectedAccounts.size === accounts.length && accounts.length > 0;
-                selectAll.indeterminate = selectedAccounts.size > 0 && selectedAccounts.size < accounts.length;
+                const filtered = getFilteredAccounts();
+                const selectedInFiltered = filtered.filter(a => selectedAccounts.has(a.phone)).length;
+                selectAll.checked = filtered.length > 0 && selectedInFiltered === filtered.length;
+                selectAll.indeterminate = selectedInFiltered > 0 && selectedInFiltered < filtered.length;
             }
         }
 
         document.getElementById('selectAll').addEventListener('change', (e) => {
-            if (e.target.checked) {
-                accounts.forEach(a => selectedAccounts.add(a.phone));
-            } else {
-                selectedAccounts.clear();
-            }
+            const filtered = getFilteredAccounts();
+            if (e.target.checked) filtered.forEach(a => selectedAccounts.add(a.phone));
+            else filtered.forEach(a => selectedAccounts.delete(a.phone));
             updateTable();
         });
 
         document.getElementById('searchInput').addEventListener('input', updateTable);
         document.getElementById('typeFilter').addEventListener('change', updateTable);
         document.getElementById('statusFilter').addEventListener('change', updateTable);
+
+        function getFilteredAccounts() {
+            const search = document.getElementById('searchInput').value.toLowerCase();
+            const type = document.getElementById('typeFilter').value;
+            const status = document.getElementById('statusFilter').value;
+
+            return accounts.filter(a => {
+                if (search && !a.phone?.toLowerCase().includes(search)) return false;
+                if (type && a.account_type !== type) return false;
+                if (status === 'active' && (a.is_banned || a.is_frozen)) return false;
+                if (status === 'banned' && !a.is_banned) return false;
+                if (status === 'frozen' && !a.is_frozen) return false;
+                return true;
+            });
+        }
+
+        function selectFilteredAccounts() {
+            getFilteredAccounts().forEach(a => selectedAccounts.add(a.phone));
+            updateTable();
+            updateSelectAllCheckbox();
+        }
+
+        function clearSelection() {
+            selectedAccounts.clear();
+            updateTable();
+            updateSelectAllCheckbox();
+        }
 
         async function scanSessions() {
             const btn = event.target;
@@ -416,6 +438,83 @@
                 updateSelectAllCheckbox();
                 alert('Прокси назначены');
             }
+        }
+
+        async function unassignProxies() {
+            if (selectedAccounts.size === 0) {
+                alert('Выберите аккаунты');
+                return;
+            }
+            const response = await fetch('/api/accounts/unassign-proxy', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ phones: Array.from(selectedAccounts) })
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                alert(data.error || 'Ошибка отключения прокси');
+                return;
+            }
+            await loadAccounts();
+            selectedAccounts.clear();
+            updateSelectAllCheckbox();
+            alert('Прокси отключены');
+        }
+
+        async function deleteSelectedAccounts() {
+            if (selectedAccounts.size === 0) {
+                alert('Выберите аккаунты');
+                return;
+            }
+            if (!confirm(`Удалить выбранные аккаунты (${selectedAccounts.size})?`)) return;
+            const response = await fetch('/api/accounts/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ phones: Array.from(selectedAccounts) })
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                alert(data.error || 'Ошибка удаления аккаунтов');
+                return;
+            }
+            selectedAccounts.clear();
+            await loadAccounts();
+            alert(`Удалено аккаунтов: ${data.count || 0}`);
+        }
+
+        async function deleteSingleAccount(phone) {
+            if (!confirm(`Удалить аккаунт ${phone}?`)) return;
+            const response = await fetch('/api/accounts/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ phones: [phone] })
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                alert(data.error || 'Ошибка удаления аккаунта');
+                return;
+            }
+            selectedAccounts.delete(phone);
+            await loadAccounts();
+        }
+
+        async function toggleProxy(phone, hasProxy) {
+            if (hasProxy) {
+                const response = await fetch('/api/accounts/unassign-proxy', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ phones: [phone] })
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    alert(data.error || 'Ошибка отключения прокси');
+                    return;
+                }
+                await loadAccounts();
+                return;
+            }
+            selectedAccounts = new Set([phone]);
+            assignProxies();
         }
     </script>
 </body>

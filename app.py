@@ -6,6 +6,7 @@ import os
 import json
 import sqlite3
 import io
+import subprocess
 from datetime import datetime, date
 from werkzeug.utils import secure_filename
 import pandas as pd
@@ -159,7 +160,40 @@ if DEFAULT_API_ID and DEFAULT_API_HASH:
     db.set_config('api_hash', DEFAULT_API_HASH)
 
 def run_async(coro):
-    """Запуск coroutine в синхронном Flask route."""
+    """Безопасный запуск coroutine в синхронном Flask route.
+
+    Если в текущем потоке уже запущен event loop (eventlet/gunicorn сценарии),
+    выносим выполнение в отдельный поток с собственным loop.
+    """
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop and running_loop.is_running():
+        result_holder = {'result': None, 'error': None}
+        done = threading.Event()
+
+        def _runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result_holder['result'] = loop.run_until_complete(coro)
+            except Exception as e:
+                result_holder['error'] = e
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                done.set()
+
+        threading.Thread(target=_runner, daemon=True).start()
+        done.wait()
+        if result_holder['error']:
+            raise result_holder['error']
+        return result_holder['result']
+
     return asyncio.run(coro)
 
 def get_api_credentials(payload=None):
@@ -229,6 +263,8 @@ checker_status = {
 
 scheduler_thread = None
 scheduler = None
+last_scheduler_autostart_check_at = 0.0
+SCHEDULER_AUTOSTART_CHECK_INTERVAL_SECONDS = 10
 
 def is_scheduler_running():
     return scheduler_thread is not None and scheduler_thread.is_alive()
@@ -239,10 +275,45 @@ def ensure_scheduler_running():
         return False
     scheduler = OutreachScheduler()
     def run_scheduler():
-        asyncio.run(scheduler.start())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(scheduler.start())
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            loop.close()
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     return True
+
+
+@app.before_request
+def ensure_scheduler_autostart():
+    """
+    Автостарт scheduler для gunicorn/eventlet.
+    Блок __main__ при таком запуске не исполняется, поэтому проверяем
+    периодически на HTTP-запросах и поднимаем scheduler, если он остановился.
+    """
+    global last_scheduler_autostart_check_at
+    now_mono = time.monotonic()
+    if now_mono - last_scheduler_autostart_check_at < SCHEDULER_AUTOSTART_CHECK_INTERVAL_SECONDS:
+        return
+    last_scheduler_autostart_check_at = now_mono
+    try:
+        auto_start_scheduler = os.getenv('AUTO_START_SCHEDULER', '0') == '1'
+        if auto_start_scheduler and has_active_campaigns() and not is_scheduler_running():
+            started = ensure_scheduler_running()
+            if started:
+                logger.info("▶ Scheduler autostarted from before_request hook")
+    except Exception as e:
+        logger.error(f"Failed scheduler autostart hook: {e}")
 
 def has_active_campaigns():
     try:
@@ -266,10 +337,34 @@ class TelegramCheckerThread(threading.Thread):
         self.processed_count = 0
         
     def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self.run_checker())
-        self.loop.close()
+        global checker_status
+        try:
+            # В окружении gunicorn/eventlet поток может оказаться с уже активным event loop.
+            # В этом случае запускаем checker как задачу существующего loop.
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if running_loop and running_loop.is_running():
+                logger.warning("Checker thread: detected active event loop, scheduling run_checker as task")
+                running_loop.create_task(self.run_checker())
+                return
+
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self.run_checker())
+        except Exception as e:
+            logger.exception(f"Checker thread crashed: {e}")
+            checker_status['running'] = False
+            socketio.emit('error', {'message': f'Ошибка запуска проверки: {str(e)}'})
+            socketio.emit('checker_stopped')
+        finally:
+            if self.loop:
+                try:
+                    self.loop.close()
+                except Exception:
+                    pass
         
     async def run_checker(self):
         global checker_status
@@ -548,6 +643,10 @@ def get_accounts_detailed():
                 ''')
             
             for row in cursor.fetchall():
+                checked_today = row[11] or 0
+                last_check_date = row[12]
+                if last_check_date != date.today().isoformat():
+                    checked_today = 0
                 accounts.append({
                     'phone': row[0],
                     'session_name': row[1],
@@ -560,8 +659,8 @@ def get_accounts_detailed():
                     'proxy_id': row[8],
                     'test_history': json.loads(row[9]) if row[9] else [],
                     'last_used': row[10],
-                    'checked_today': row[11] or 0,
-                    'last_check_date': row[12],
+                    'checked_today': checked_today,
+                    'last_check_date': last_check_date,
                     'outreach_daily_limit': row[13] or 20,
                     'fingerprint': {
                         'device_model': row[14],
@@ -618,7 +717,6 @@ def scan_new_sessions():
             continue
             
         try:
-            import asyncio
             from telethon import TelegramClient
             
             async def get_phone():
@@ -634,11 +732,7 @@ def scan_new_sessions():
                     if client:
                         await client.disconnect()
             
-            # Создаем новый цикл событий для каждой сессии
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            phone = loop.run_until_complete(get_phone())
-            loop.close()
+            phone = run_async(get_phone())
             
             if phone:
                 logger.info(f"Получен номер {phone} для сессии {session_name}")
@@ -715,26 +809,20 @@ def upload_session_file():
         return jsonify({'error': f'Не удалось сохранить файл: {str(e)}'}), 500
 
     try:
-        import asyncio
-        from telethon import TelegramClient
-
-        async def get_phone():
-            client = None
-            try:
-                client = TelegramClient(f'sessions/{session_name}', int(api_id), api_hash)
-                await client.connect()
-                if await client.is_user_authorized():
-                    me = await client.get_me()
-                    return me.phone
-                return None
-            finally:
-                if client:
-                    await client.disconnect()
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        phone = loop.run_until_complete(get_phone())
-        loop.close()
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        helper = os.path.join(base_dir, 'tools', 'extract_session_phone.py')
+        if not os.path.exists(helper):
+            helper = os.path.join(base_dir, 'extract_session_phone.py')
+        proc = subprocess.run(
+            [sys.executable, helper, f'sessions/{session_name}', str(int(api_id)), api_hash],
+            capture_output=True,
+            text=True,
+            timeout=45
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or 'session probe failed')
+        payload = json.loads(proc.stdout.strip() or '{}')
+        phone = payload.get('phone') if payload.get('ok') else None
 
         if not phone:
             try:
@@ -906,12 +994,18 @@ async def test_all_accounts_async():
 @app.route('/api/accounts/assign-proxy', methods=['POST'])
 def assign_proxy_to_accounts():
     """Назначение прокси выбранным аккаунтам"""
-    data = request.json
+    data = request.json or {}
     phones = data.get('phones', [])
     proxy_id = data.get('proxy_id')
-    
-    if not phones or not proxy_id:
-        return jsonify({'error': 'Missing data'}), 400
+
+    if not phones:
+        return jsonify({'error': 'Missing phones'}), 400
+
+    if proxy_id is not None:
+        try:
+            proxy_id = int(proxy_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Invalid proxy_id'}), 400
     
     try:
         with sqlite3.connect(db.db_path) as conn:
@@ -925,6 +1019,26 @@ def assign_proxy_to_accounts():
         logger.error(f"Error assigning proxy: {e}")
         return jsonify({'error': str(e)}), 500
     
+    return jsonify({'updated': len(phones)})
+
+
+@app.route('/api/accounts/unassign-proxy', methods=['POST'])
+def unassign_proxy_from_accounts():
+    data = request.json or {}
+    phones = data.get('phones', [])
+    if not phones:
+        return jsonify({'error': 'Missing phones'}), 400
+
+    try:
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            for phone in phones:
+                cursor.execute('UPDATE account_stats SET proxy_id = NULL WHERE phone = ?', (phone,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error unassigning proxy: {e}")
+        return jsonify({'error': str(e)}), 500
+
     return jsonify({'updated': len(phones)})
 
 @app.route('/api/config', methods=['GET'])
@@ -1291,8 +1405,6 @@ def update_outreach_campaign(campaign_id):
 
     requested_accounts = data.get('accounts', campaign.get('accounts', []))
     accounts = filter_valid_outreach_accounts(requested_accounts)
-    if not accounts:
-        return jsonify({'error': 'В кампании должен быть минимум 1 активный outreach-аккаунт'}), 400
 
     schedule = data.get('schedule', campaign.get('schedule'))
     strategy = data.get('strategy', campaign.get('strategy') or {'steps': []})
@@ -1319,14 +1431,43 @@ def update_outreach_campaign(campaign_id):
         return jsonify({'error': str(e)}), 400
     return jsonify({'status': 'updated', 'campaign': outreach.get_campaign(campaign_id)})
 
+
+@app.route('/api/outreach/campaign/<int:campaign_id>', methods=['DELETE'])
+def delete_outreach_campaign(campaign_id):
+    campaign = outreach.get_campaign(campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found'}), 404
+
+    try:
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM conversations WHERE campaign_id = ?', (campaign_id,))
+            cursor.execute('DELETE FROM outreach_contacts WHERE campaign_id = ?', (campaign_id,))
+            cursor.execute('DELETE FROM scheduler_campaign_locks WHERE campaign_id = ?', (campaign_id,))
+            cursor.execute('DELETE FROM outreach_campaigns WHERE id = ?', (campaign_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error deleting campaign {campaign_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+    if not has_active_campaigns():
+        global scheduler, scheduler_thread
+        if scheduler:
+            scheduler.stop()
+            scheduler = None
+        scheduler_thread = None
+
+    return jsonify({'status': 'deleted', 'campaign_id': campaign_id})
+
 @app.route('/api/outreach/campaign/<int:campaign_id>', methods=['GET'])
 def get_outreach_campaign(campaign_id):
     return jsonify(outreach.get_campaign(campaign_id))
 
 @app.route('/api/outreach/campaign/<int:campaign_id>/contacts')
 def get_campaign_contacts(campaign_id):
-    limit = request.args.get('limit', 50, type=int)
-    return jsonify(outreach.get_campaign_contacts(campaign_id, limit))
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    return jsonify(outreach.get_campaign_contacts(campaign_id, limit=limit, offset=offset))
 
 @app.route('/api/outreach/blacklist', methods=['GET'])
 def get_outreach_blacklist():
@@ -1831,6 +1972,65 @@ def update_account_type(phone):
     except Exception as e:
         logger.error(f"Error updating account type: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/accounts/delete', methods=['POST'])
+def delete_accounts():
+    data = request.get_json(silent=True) or {}
+    phones = data.get('phones') or []
+    if not phones:
+        return jsonify({'error': 'Не переданы аккаунты для удаления'}), 400
+
+    deleted = []
+    try:
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+
+            placeholders = ",".join("?" for _ in phones)
+            cursor.execute(
+                f"SELECT phone, session_name FROM account_stats WHERE phone IN ({placeholders})",
+                phones
+            )
+            existing = cursor.fetchall()
+            existing_map = {row[0]: row[1] for row in existing}
+
+            # Удаляем ссылки на аккаунты из кампаний.
+            cursor.execute("SELECT id, accounts FROM outreach_campaigns")
+            for campaign_id, accounts_json in cursor.fetchall():
+                try:
+                    acc = json.loads(accounts_json) if accounts_json else []
+                except Exception:
+                    acc = []
+                new_acc = [a for a in acc if a not in phones]
+                if new_acc != acc:
+                    cursor.execute(
+                        "UPDATE outreach_campaigns SET accounts = ? WHERE id = ?",
+                        (json.dumps(new_acc), campaign_id)
+                    )
+
+            for phone in phones:
+                session_name = existing_map.get(phone)
+                if not session_name:
+                    continue
+
+                cursor.execute("DELETE FROM account_fingerprints WHERE account_phone = ?", (phone,))
+                cursor.execute("DELETE FROM account_stats WHERE phone = ?", (phone,))
+
+                session_path = os.path.join('sessions', f'{session_name}.session')
+                journal_path = f"{session_path}-journal"
+                if os.path.exists(session_path):
+                    os.remove(session_path)
+                if os.path.exists(journal_path):
+                    os.remove(journal_path)
+
+                deleted.append(phone)
+
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error deleting accounts: {e}")
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'status': 'deleted', 'deleted': deleted, 'count': len(deleted)})
 
 @app.route('/api/accounts/<path:phone>/outreach-limit', methods=['POST'])
 def update_outreach_limit(phone):

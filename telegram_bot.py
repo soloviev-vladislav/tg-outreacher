@@ -1037,10 +1037,38 @@ class OutreachManager:
             raise Exception("Импорт не выполнен: нет валидных контактов для добавления (или все в blacklist/дубликаты)")
         return {'imported': imported, 'skipped': skipped}
     
-    def get_campaign_contacts(self, campaign_id: int, limit: int = 50) -> List[dict]:
-        """Получение контактов кампании"""
+    def get_campaign_contacts(self, campaign_id: int, limit: int = 50, offset: int = 0) -> dict:
+        """Получение контактов кампании с пагинацией и агрегированной статистикой."""
+        limit = max(1, min(int(limit or 50), 1000))
+        offset = max(0, int(offset or 0))
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM outreach_contacts
+                WHERE campaign_id = ?
+            ''', (campaign_id,))
+            total = int(cursor.fetchone()[0] or 0)
+
+            cursor.execute('''
+                SELECT status, COUNT(*)
+                FROM outreach_contacts
+                WHERE campaign_id = ?
+                GROUP BY status
+            ''', (campaign_id,))
+            counts_raw = cursor.fetchall()
+            status_counts = {
+                'new': 0,
+                'sent': 0,
+                'ignored': 0,
+                'replied': 0,
+                'failed': 0
+            }
+            for status, count in counts_raw:
+                key = str(status or '').lower()
+                if key in status_counts:
+                    status_counts[key] = int(count or 0)
+
             cursor.execute('''
                 SELECT oc.id, oc.phone, oc.name, oc.company, oc.position, oc.status, 
                        oc.message_sent_at, oc.replied_at, oc.last_message, oc.notes, oc.account_used,
@@ -1065,7 +1093,8 @@ class OutreachManager:
                     END,
                     oc.id DESC
                 LIMIT ?
-            ''', (campaign_id, limit))
+                OFFSET ?
+            ''', (campaign_id, limit, offset))
             
             contacts = []
             for row in cursor.fetchall():
@@ -1086,7 +1115,13 @@ class OutreachManager:
                     'access_hash': row[13],
                     'last_step_id': row[14]
                 })
-            return contacts
+            return {
+                'items': contacts,
+                'total': total,
+                'limit': limit,
+                'offset': offset,
+                'status_counts': status_counts
+            }
     
     def get_templates(self) -> List[dict]:
         """Получение списка шаблонов"""
@@ -1304,7 +1339,7 @@ class TelegramAccountManager:
 
         except Exception as e:
             error_str = str(e).lower()
-            if "frozen" in error_str:
+            if "frozen" in error_str or "frozen_method_invalid" in error_str:
                 logger.error(f"  ❄️ Сессия FROZEN!")
                 frozen_detected = True
                 details.append({'phone': test_phone, 'result': 'frozen'})
@@ -1808,11 +1843,17 @@ class TelegramAccountManager:
             return None
         except Exception as e:
             error_str = str(e)
-            if "frozen accounts" in error_str.lower():
-                logger.error(f"❄️ Аккаунт {stats.phone} FROZEN при проверке - удаляем")
+            frozen_markers = (
+                "frozen accounts",
+                "frozen_method_invalid",
+                "method_invalid"
+            )
+            if any(marker in error_str.lower() for marker in frozen_markers):
+                logger.error(f"❄️ Аккаунт {stats.phone} FROZEN при проверке ({error_str})")
                 stats.mark_frozen()
                 self.db.mark_account_banned(stats.phone, "frozen")
                 self.db.delete_frozen_session(stats.session_name, self.session_dir)
+                self.save_stats()
                 return None
             else:
                 logger.error(f"Error checking {phone_number}: {e}")

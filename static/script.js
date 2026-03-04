@@ -60,6 +60,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Загружаем список аккаунтов (только checker)
     loadCheckerAccounts();
+    loadSavedConfig();
+    loadLastHistory();
 
     // Загружаем список файлов
     loadFiles();
@@ -70,6 +72,68 @@ document.addEventListener('DOMContentLoaded', () => {
     // Добавляем обработчики кнопок
     setupButtonHandlers();
 });
+
+async function loadSavedConfig() {
+    try {
+        const response = await fetch('/api/config');
+        const data = await response.json();
+        if (!response.ok || !data) return;
+
+        const targetChatInput = document.getElementById('targetChat');
+        const delayInput = document.getElementById('delay');
+        if (targetChatInput && data.target_chat) targetChatInput.value = data.target_chat;
+        if (delayInput && data.delay) delayInput.value = data.delay;
+        if (phonesTextarea && data.phones_text) phonesTextarea.value = data.phones_text;
+    } catch (error) {
+        console.error('Error loading saved config:', error);
+    }
+}
+
+async function loadLastHistory() {
+    try {
+        const response = await fetch('/api/history?limit=20');
+        const history = await response.json();
+        if (!response.ok || !Array.isArray(history) || history.length === 0) return;
+
+        if (recentResults) recentResults.innerHTML = '';
+        let reg = 0;
+        let nreg = 0;
+        let err = 0;
+
+        history
+            .slice()
+            .reverse()
+            .forEach(item => {
+                const status = item.registered ? 'registered' : 'not_registered';
+                if (item.registered) reg += 1;
+                else nreg += 1;
+                addResult({
+                    phone: item.phone,
+                    status,
+                    user_info: {
+                        user_id: item.user_id,
+                        username: item.username,
+                        first_name: item.first_name,
+                        last_name: item.last_name
+                    },
+                    message: status === 'registered' ? 'Найден' : 'Не зарегистрирован'
+                });
+            });
+
+        if (registeredCount) registeredCount.textContent = reg;
+        if (notRegisteredCount) notRegisteredCount.textContent = nreg;
+        if (errorCount) errorCount.textContent = err;
+        if (processedCount) processedCount.textContent = reg + nreg + err;
+        if (totalCount) totalCount.textContent = `/${reg + nreg + err}`;
+        if (progressBar) progressBar.style.width = '100%';
+        if (timeRemaining) timeRemaining.textContent = 'Осталось: 0 сек';
+
+        chartData.datasets[0].data = [reg, nreg, err];
+        if (statsChart) statsChart.update();
+    } catch (error) {
+        console.error('Error loading last history:', error);
+    }
+}
 
 // Настройка обработчиков кнопок
 function setupButtonHandlers() {
