@@ -6,7 +6,7 @@ const BASE_CONTACTS_PAGE_SIZE = 100;
 document.addEventListener('DOMContentLoaded', async () => {
     setupHandlers();
     setupDorksControls();
-    await Promise.all([loadBases(), loadBlacklist()]);
+    await Promise.all([loadBases(), loadBlacklist(), loadDorksRuns()]);
 });
 
 function setupHandlers() {
@@ -17,6 +17,7 @@ function setupHandlers() {
     });
     document.getElementById('parseChatBtn')?.addEventListener('click', parseChatToBase);
     document.getElementById('runDorksBtn')?.addEventListener('click', runDorksCollection);
+    document.getElementById('reloadDorksRunsBtn')?.addEventListener('click', loadDorksRuns);
 
     const uploadArea = document.getElementById('baseUploadArea');
     const fileInput = document.getElementById('baseFileInput');
@@ -309,7 +310,96 @@ async function runDorksCollection() {
     status.textContent = `Готово: imported ${data.imported || 0}, skipped ${data.skipped || 0}, dedup ${data.dedup_total || 0}`;
     document.getElementById('dorkPositionInput').value = '';
     document.getElementById('dorkBaseNameInput').value = '';
-    await loadBases();
+    await Promise.all([loadBases(), loadDorksRuns()]);
+}
+
+async function loadDorksRuns() {
+    const wrap = document.getElementById('dorksRunsList');
+    if (!wrap || !IS_ADMIN) return;
+    const details = document.getElementById('dorksRunDetails');
+    if (details) details.innerHTML = '';
+    const response = await fetch('/api/bases/dorks/runs?limit=30');
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        wrap.innerHTML = `<div class="muted-text">${escapeHtml(data.error || 'Ошибка загрузки dorks-логов')}</div>`;
+        return;
+    }
+    const runs = Array.isArray(data) ? data : [];
+    if (!runs.length) {
+        wrap.innerHTML = '<div class="muted-text">Запусков пока нет</div>';
+        return;
+    }
+    wrap.innerHTML = runs.map(r => `
+        <div class="card" style="margin-bottom: 8px; padding: 10px;">
+            <div class="panel-head">
+                <div>
+                    <strong>#${r.id} · ${escapeHtml(r.position || '')}</strong>
+                    <div class="muted-text">
+                        ${escapeHtml(r.created_at || '')} · ${escapeHtml(r.language || '')} · ${escapeHtml((r.sources || []).join(', '))}
+                        · q ${Number(r.queries_total || 0)} · ok ${Number(r.requests_ok || 0)} · fail ${Number(r.requests_failed || 0)}
+                        · imported ${Number(r.imported || 0)}
+                    </div>
+                </div>
+                <button class="btn btn-small" data-action="open-dorks-run" data-id="${Number(r.id)}">Детали</button>
+            </div>
+        </div>
+    `).join('');
+
+    wrap.querySelectorAll('button[data-action="open-dorks-run"]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const runId = Number(btn.dataset.id);
+            if (!Number.isFinite(runId) || runId <= 0) return;
+            await loadDorksRunDetails(runId);
+        });
+    });
+}
+
+async function loadDorksRunDetails(runId) {
+    const details = document.getElementById('dorksRunDetails');
+    if (!details) return;
+    details.innerHTML = 'Загрузка деталей...';
+    const response = await fetch(`/api/bases/dorks/runs/${runId}`);
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        details.innerHTML = `<div class="muted-text">${escapeHtml(data.error || 'Ошибка загрузки деталей')}</div>`;
+        return;
+    }
+    const run = data.run || {};
+    const queries = Array.isArray(data.queries) ? data.queries : [];
+    details.innerHTML = `
+        <div class="card" style="padding: 10px;">
+            <div><strong>Dorks run #${Number(run.id || runId)}</strong></div>
+            <div class="muted-text" style="margin:6px 0 10px 0;">
+                position: ${escapeHtml(run.position || '')} · base: ${escapeHtml(run.base_name || '')} · status: ${escapeHtml(run.status || '')}
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Источник</th>
+                            <th>Запрос</th>
+                            <th>Статус</th>
+                            <th>HTTP</th>
+                            <th>Выдача</th>
+                            <th>Usernames</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${queries.map(q => `
+                            <tr>
+                                <td>${escapeHtml(q.source || '')}</td>
+                                <td><small>${escapeHtml(q.query || '')}</small></td>
+                                <td>${escapeHtml(q.status || '')}</td>
+                                <td>${escapeHtml(String(q.http_status ?? ''))}</td>
+                                <td>${Number(q.result_items || 0)}</td>
+                                <td>${Number(q.usernames_found || 0)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
 }
 
 async function loadBlacklist() {

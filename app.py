@@ -228,6 +228,44 @@ def ensure_db_schema():
             )
         ''')
         cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dorks_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER DEFAULT 1,
+                user_id INTEGER,
+                position TEXT NOT NULL,
+                language TEXT NOT NULL,
+                sources_json TEXT NOT NULL,
+                base_name TEXT NOT NULL,
+                results_limit INTEGER NOT NULL,
+                queries_total INTEGER DEFAULT 0,
+                requests_ok INTEGER DEFAULT 0,
+                requests_failed INTEGER DEFAULT 0,
+                found_total INTEGER DEFAULT 0,
+                dedup_total INTEGER DEFAULT 0,
+                imported INTEGER DEFAULT 0,
+                skipped INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'ok',
+                error_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dorks_run_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                tenant_id INTEGER DEFAULT 1,
+                source TEXT NOT NULL,
+                query_text TEXT NOT NULL,
+                status TEXT DEFAULT 'ok',
+                http_status INTEGER,
+                result_items INTEGER DEFAULT 0,
+                usernames_found INTEGER DEFAULT 0,
+                error_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(run_id) REFERENCES dorks_runs(id)
+            )
+        ''')
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS outreach_blacklist (
                 tenant_id INTEGER DEFAULT 1,
                 user_id INTEGER PRIMARY KEY,
@@ -254,7 +292,7 @@ def ensure_db_schema():
             'outreach_campaigns', 'outreach_contacts', 'conversations', 'account_stats',
             'proxies', 'account_fingerprints', 'form_data', 'check_history',
             'outreach_templates', 'outreach_blacklist', 'scheduler_campaign_locks'
-            , 'outreach_bases', 'outreach_base_contacts'
+            , 'outreach_bases', 'outreach_base_contacts', 'dorks_runs', 'dorks_run_queries'
         ):
             try:
                 cursor.execute(f'UPDATE {table} SET tenant_id = ? WHERE tenant_id IS NULL', (default_tenant_id,))
@@ -285,6 +323,8 @@ def ensure_db_schema():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_templates_tenant ON outreach_templates(tenant_id, name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_bases_tenant ON outreach_bases(tenant_id, created_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_base_contacts_tenant ON outreach_base_contacts(tenant_id, base_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dorks_runs_tenant ON dorks_runs(tenant_id, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dorks_run_queries_run ON dorks_run_queries(tenant_id, run_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_stats_added_by ON account_stats(tenant_id, added_by_user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_campaigns_created_by ON outreach_campaigns(tenant_id, created_by_user_id)')
         cursor.execute("UPDATE users SET role = 'user' WHERE role = 'viewer'")
@@ -2938,6 +2978,7 @@ def collect_base_by_dorks():
     found_candidates = []
     requests_ok = 0
     requests_failed = 0
+    query_stats = []
 
     headers = {
         'X-API-KEY': serper_api_key,
@@ -2953,16 +2994,27 @@ def collect_base_by_dorks():
             )
             if response.status_code != 200:
                 requests_failed += 1
+                query_stats.append({
+                    'source': source,
+                    'query': query,
+                    'status': 'error',
+                    'http_status': int(response.status_code),
+                    'result_items': 0,
+                    'usernames_found': 0,
+                    'error_text': f'http_{response.status_code}'
+                })
                 continue
             payload = response.json() if response.content else {}
             organic = payload.get('organic') or []
             requests_ok += 1
+            usernames_found_for_query = 0
             for item in organic:
                 link = str(item.get('link') or '').strip()
                 title = str(item.get('title') or '').strip()
                 snippet = str(item.get('snippet') or '').strip()
                 usernames = _extract_usernames_from_result(link=link, title=title, snippet=snippet)
                 for u in usernames:
+                    usernames_found_for_query += 1
                     found_candidates.append({
                         'username': u,
                         'name': None,
@@ -2971,8 +3023,26 @@ def collect_base_by_dorks():
                         'source_url': link,
                         'matched_query': query
                     })
+            query_stats.append({
+                'source': source,
+                'query': query,
+                'status': 'ok',
+                'http_status': int(response.status_code),
+                'result_items': len(organic),
+                'usernames_found': usernames_found_for_query,
+                'error_text': None
+            })
         except Exception:
             requests_failed += 1
+            query_stats.append({
+                'source': source,
+                'query': query,
+                'status': 'error',
+                'http_status': None,
+                'result_items': 0,
+                'usernames_found': 0,
+                'error_text': 'request_exception'
+            })
 
     # Дедуп по username.
     unique_by_username = {}
@@ -2985,43 +3055,194 @@ def collect_base_by_dorks():
             unique_by_username[key] = item
     deduped = list(unique_by_username.values())[:results_limit]
 
-    if not deduped:
-        return jsonify({
-            'error': 'По запросам ничего не найдено',
-            'queries_total': len(queries),
-            'requests_ok': requests_ok,
-            'requests_failed': requests_failed
-        }), 400
+    base_id = None
+    imported = 0
+    skipped = 0
+    status = 'ok'
+    error_text = None
 
-    base_id = outreach.create_base(
-        name=base_name,
-        tenant_id=tenant_id,
-        created_by_user_id=int(user.get('id') or 0)
-    )
-    contacts = [{
-        'phone': None,
-        'username': d['username'],
-        'access_hash': None,
-        'name': d.get('name'),
-        'company': d.get('company'),
-        'position': d.get('position'),
-        'user_id': None
-    } for d in deduped]
-    result = outreach.add_base_contacts(
-        base_id=base_id,
-        contacts=contacts,
-        tenant_id=tenant_id,
-        source_file=f'dorks:{position}'
-    )
-    return jsonify({
+    if deduped:
+        base_id = outreach.create_base(
+            name=base_name,
+            tenant_id=tenant_id,
+            created_by_user_id=int(user.get('id') or 0)
+        )
+        contacts = [{
+            'phone': None,
+            'username': d['username'],
+            'access_hash': None,
+            'name': d.get('name'),
+            'company': d.get('company'),
+            'position': d.get('position'),
+            'user_id': None
+        } for d in deduped]
+        result = outreach.add_base_contacts(
+            base_id=base_id,
+            contacts=contacts,
+            tenant_id=tenant_id,
+            source_file=f'dorks:{position}'
+        )
+        imported = int(result.get('imported', 0) or 0)
+        skipped = int(result.get('skipped', 0) or 0)
+    else:
+        status = 'empty'
+        error_text = 'По запросам ничего не найдено'
+
+    # Временный аудит dorks-запусков для настройки.
+    run_id = None
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO dorks_runs (
+                tenant_id, user_id, position, language, sources_json, base_name, results_limit,
+                queries_total, requests_ok, requests_failed, found_total, dedup_total,
+                imported, skipped, status, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            tenant_id, int(user.get('id') or 0), position, language, json.dumps(sources, ensure_ascii=False),
+            base_name, results_limit, len(queries), requests_ok, requests_failed, len(found_candidates),
+            len(deduped), imported, skipped, status, error_text
+        ))
+        run_id = int(cursor.lastrowid)
+        for q in query_stats:
+            cursor.execute('''
+                INSERT INTO dorks_run_queries (
+                    run_id, tenant_id, source, query_text, status, http_status, result_items, usernames_found, error_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                run_id, tenant_id, str(q.get('source') or ''), str(q.get('query') or ''),
+                str(q.get('status') or 'ok'), q.get('http_status'),
+                int(q.get('result_items') or 0), int(q.get('usernames_found') or 0),
+                q.get('error_text')
+            ))
+        conn.commit()
+
+    resp = {
+        'run_id': run_id,
         'base_id': base_id,
         'queries_total': len(queries),
         'requests_ok': requests_ok,
         'requests_failed': requests_failed,
         'found_total': len(found_candidates),
         'dedup_total': len(deduped),
-        'imported': result.get('imported', 0),
-        'skipped': result.get('skipped', 0)
+        'imported': imported,
+        'skipped': skipped,
+        'query_stats': query_stats
+    }
+    if status == 'empty':
+        return jsonify({'error': error_text, **resp}), 400
+    return jsonify(resp)
+
+
+@app.route('/api/bases/dorks/runs', methods=['GET'])
+def get_dorks_runs():
+    user = get_current_user() or {}
+    if not is_admin_user(user):
+        return jsonify({'error': 'Forbidden'}), 403
+    tenant_id = get_current_tenant_id()
+    limit = request.args.get('limit', 20, type=int)
+    limit = max(1, min(200, int(limit or 20)))
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, position, language, sources_json, base_name, results_limit,
+                   queries_total, requests_ok, requests_failed, found_total, dedup_total,
+                   imported, skipped, status, error_text, created_at
+            FROM dorks_runs
+            WHERE tenant_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        ''', (tenant_id, limit))
+        rows = cursor.fetchall()
+
+    result = []
+    for r in rows:
+        try:
+            sources = json.loads(r[3]) if r[3] else []
+        except Exception:
+            sources = []
+        result.append({
+            'id': int(r[0]),
+            'position': r[1],
+            'language': r[2],
+            'sources': sources,
+            'base_name': r[4],
+            'results_limit': int(r[5] or 0),
+            'queries_total': int(r[6] or 0),
+            'requests_ok': int(r[7] or 0),
+            'requests_failed': int(r[8] or 0),
+            'found_total': int(r[9] or 0),
+            'dedup_total': int(r[10] or 0),
+            'imported': int(r[11] or 0),
+            'skipped': int(r[12] or 0),
+            'status': r[13],
+            'error_text': r[14],
+            'created_at': r[15]
+        })
+    return jsonify(result)
+
+
+@app.route('/api/bases/dorks/runs/<int:run_id>', methods=['GET'])
+def get_dorks_run_details(run_id: int):
+    user = get_current_user() or {}
+    if not is_admin_user(user):
+        return jsonify({'error': 'Forbidden'}), 403
+    tenant_id = get_current_tenant_id()
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, position, language, sources_json, base_name, results_limit,
+                   queries_total, requests_ok, requests_failed, found_total, dedup_total,
+                   imported, skipped, status, error_text, created_at
+            FROM dorks_runs
+            WHERE tenant_id = ? AND id = ?
+            LIMIT 1
+        ''', (tenant_id, run_id))
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({'error': 'Run not found'}), 404
+        cursor.execute('''
+            SELECT source, query_text, status, http_status, result_items, usernames_found, error_text, created_at
+            FROM dorks_run_queries
+            WHERE tenant_id = ? AND run_id = ?
+            ORDER BY id ASC
+        ''', (tenant_id, run_id))
+        qrows = cursor.fetchall()
+
+    try:
+        sources = json.loads(row[3]) if row[3] else []
+    except Exception:
+        sources = []
+    return jsonify({
+        'run': {
+            'id': int(row[0]),
+            'position': row[1],
+            'language': row[2],
+            'sources': sources,
+            'base_name': row[4],
+            'results_limit': int(row[5] or 0),
+            'queries_total': int(row[6] or 0),
+            'requests_ok': int(row[7] or 0),
+            'requests_failed': int(row[8] or 0),
+            'found_total': int(row[9] or 0),
+            'dedup_total': int(row[10] or 0),
+            'imported': int(row[11] or 0),
+            'skipped': int(row[12] or 0),
+            'status': row[13],
+            'error_text': row[14],
+            'created_at': row[15]
+        },
+        'queries': [{
+            'source': q[0],
+            'query': q[1],
+            'status': q[2],
+            'http_status': q[3],
+            'result_items': int(q[4] or 0),
+            'usernames_found': int(q[5] or 0),
+            'error_text': q[6],
+            'created_at': q[7]
+        } for q in qrows]
     })
 
 @app.route('/api/outreach/campaigns', methods=['GET'])
