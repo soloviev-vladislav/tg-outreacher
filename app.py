@@ -2682,7 +2682,7 @@ def upload_base_contacts():
         if os.path.exists(filepath):
             os.remove(filepath)
 
-async def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
+def _get_service_session_for_parsing(tenant_id: int):
     api_id, api_hash = get_api_credentials()
     if not api_id or not api_hash:
         raise RuntimeError('API credentials are not configured')
@@ -2704,31 +2704,39 @@ async def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
         raise RuntimeError('Нет доступных service-сессий для парсинга')
 
     session_name = row[1] or row[0]
-    session_path = os.path.join('sessions', session_name)
-    client = TelegramClient(session_path, int(api_id), api_hash, loop=asyncio.get_running_loop())
-    await client.connect()
+    return int(api_id), api_hash, session_name
+
+def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
+    api_id, api_hash, session_name = _get_service_session_for_parsing(tenant_id)
+    script_path = os.path.abspath(os.path.join('tools', 'parse_chat_members.py'))
+    if not os.path.exists(script_path):
+        raise RuntimeError(f'Parser script not found: {script_path}')
+
+    session_path = os.path.abspath(os.path.join('sessions', session_name))
+    cmd = [
+        sys.executable,
+        script_path,
+        '--session', session_path,
+        '--api-id', str(api_id),
+        '--api-hash', api_hash,
+        '--chat', chat_ref
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=300
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or '').strip()
+        raise RuntimeError(err or 'Chat parse failed')
     try:
-        if not await client.is_user_authorized():
-            raise RuntimeError(f'Service-сессия {session_name} не авторизована в Telegram')
-        entity = await client.get_entity(chat_ref)
-        participants = await client.get_participants(entity, aggressive=False)
-        contacts = []
-        for p in participants:
-            username = getattr(p, 'username', None)
-            if not username:
-                continue
-            contacts.append({
-                'phone': None,
-                'username': username,
-                'access_hash': str(getattr(p, 'access_hash', '') or '') or None,
-                'name': ' '.join([x for x in [getattr(p, 'first_name', ''), getattr(p, 'last_name', '')] if x]).strip() or None,
-                'company': None,
-                'position': None,
-                'user_id': int(getattr(p, 'id', 0) or 0) or None
-            })
-        return contacts
-    finally:
-        await client.disconnect()
+        data = json.loads((proc.stdout or '[]').strip() or '[]')
+    except Exception as e:
+        raise RuntimeError(f'Некорректный ответ парсера: {e}') from e
+    if not isinstance(data, list):
+        raise RuntimeError('Некорректный формат данных парсера')
+    return data
 
 @app.route('/api/bases/parse-chat', methods=['POST'])
 def parse_chat_to_base():
@@ -2742,7 +2750,7 @@ def parse_chat_to_base():
     if not base_name:
         return jsonify({'error': 'base_name is required'}), 400
     try:
-        contacts = run_async(_parse_chat_members_with_service(tenant_id, chat_ref))
+        contacts = _parse_chat_members_with_service(tenant_id, chat_ref)
         if not contacts:
             return jsonify({'error': 'В чате не найдены участники с username'}), 400
         base_id = outreach.create_base(name=base_name, tenant_id=tenant_id, created_by_user_id=int(user.get('id') or 0))
