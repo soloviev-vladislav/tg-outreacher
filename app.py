@@ -2742,7 +2742,7 @@ def parse_chat_to_base():
     if not base_name:
         return jsonify({'error': 'base_name is required'}), 400
     try:
-        contacts = run_async_threadsafe(_parse_chat_members_with_service(tenant_id, chat_ref))
+        contacts = run_async(_parse_chat_members_with_service(tenant_id, chat_ref))
         if not contacts:
             return jsonify({'error': 'В чате не найдены участники с username'}), 400
         base_id = outreach.create_base(name=base_name, tenant_id=tenant_id, created_by_user_id=int(user.get('id') or 0))
