@@ -2696,7 +2696,7 @@ def _get_service_session_for_parsing(tenant_id: int):
               AND account_type = 'service'
               AND COALESCE(is_banned, 0) = 0
               AND COALESCE(is_frozen, 0) = 0
-            ORDER BY id DESC
+            ORDER BY rowid DESC
             LIMIT 1
         ''', (tenant_id,))
         row = cursor.fetchone()
