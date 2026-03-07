@@ -2649,6 +2649,50 @@ def get_base_contacts(base_id: int):
     offset = request.args.get('offset', 0, type=int)
     return jsonify(outreach.get_base_contacts(base_id=base_id, limit=limit, offset=offset, tenant_id=tenant_id))
 
+@app.route('/api/bases/<int:base_id>/export', methods=['GET'])
+def export_base_contacts(base_id: int):
+    base = get_base_for_current_user(base_id)
+    if not base:
+        return jsonify({'error': 'Base not found'}), 404
+    tenant_id = get_current_tenant_id()
+    fmt = str(request.args.get('format') or 'csv').strip().lower()
+    if fmt not in ('csv', 'xlsx'):
+        return jsonify({'error': 'format must be csv or xlsx'}), 400
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT user_id, username, phone, name, company, position, access_hash, created_at
+            FROM outreach_base_contacts
+            WHERE tenant_id = ? AND base_id = ?
+            ORDER BY id ASC
+        ''', (tenant_id, base_id))
+        rows = cursor.fetchall()
+
+    columns = ['user_id', 'username', 'phone', 'name', 'company', 'position', 'access_hash', 'created_at']
+    df = pd.DataFrame(rows, columns=columns)
+
+    safe_name = secure_filename(str(base.get('name') or f'base_{base_id}')) or f'base_{base_id}'
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if fmt == 'xlsx':
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='contacts')
+        output.seek(0)
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'{safe_name}_{timestamp}.xlsx'
+        )
+
+    csv_data = df.to_csv(index=False)
+    return Response(
+        csv_data,
+        mimetype='text/csv; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename={safe_name}_{timestamp}.csv'}
+    )
+
 @app.route('/api/bases/upload', methods=['POST'])
 def upload_base_contacts():
     tenant_id = get_current_tenant_id()

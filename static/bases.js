@@ -67,6 +67,7 @@ function renderBases() {
                     </div>
                     <div class="btn-group">
                         <button class="btn btn-small" data-action="toggle" data-id="${baseId}">Открыть</button>
+                        <button class="btn btn-small" data-action="download" data-id="${baseId}">Скачать CSV</button>
                         <button class="btn btn-small btn-danger" data-action="delete" data-id="${baseId}">Удалить</button>
                     </div>
                 </div>
@@ -105,6 +106,14 @@ function renderBases() {
                 return;
             }
             await loadBases();
+        });
+    });
+
+    wrap.querySelectorAll('button[data-action="download"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const baseId = Number(btn.dataset.id);
+            if (!Number.isFinite(baseId) || baseId <= 0) return;
+            window.open(`/api/bases/${baseId}/export?format=csv`, '_blank');
         });
     });
 }
