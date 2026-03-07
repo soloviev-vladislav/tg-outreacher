@@ -149,6 +149,8 @@ def ensure_db_schema():
             cursor.execute('ALTER TABLE outreach_campaigns ADD COLUMN tenant_id INTEGER DEFAULT 1')
         if 'created_by_user_id' not in columns:
             cursor.execute('ALTER TABLE outreach_campaigns ADD COLUMN created_by_user_id INTEGER')
+        if 'base_id' not in columns:
+            cursor.execute('ALTER TABLE outreach_campaigns ADD COLUMN base_id INTEGER')
         cursor.execute("PRAGMA table_info(outreach_contacts)")
         contact_columns = [col[1] for col in cursor.fetchall()]
         if 'username' not in contact_columns:
@@ -198,6 +200,32 @@ def ensure_db_schema():
         if 'tenant_id' not in lock_columns:
             cursor.execute('ALTER TABLE scheduler_campaign_locks ADD COLUMN tenant_id INTEGER DEFAULT 1')
         cursor.execute('''
+            CREATE TABLE IF NOT EXISTS outreach_bases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER DEFAULT 1,
+                created_by_user_id INTEGER,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS outreach_base_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER DEFAULT 1,
+                base_id INTEGER NOT NULL,
+                phone TEXT,
+                username TEXT,
+                access_hash TEXT,
+                name TEXT,
+                company TEXT,
+                position TEXT,
+                source_file TEXT,
+                user_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(base_id) REFERENCES outreach_bases(id)
+            )
+        ''')
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS outreach_blacklist (
                 tenant_id INTEGER DEFAULT 1,
                 user_id INTEGER PRIMARY KEY,
@@ -224,6 +252,7 @@ def ensure_db_schema():
             'outreach_campaigns', 'outreach_contacts', 'conversations', 'account_stats',
             'proxies', 'account_fingerprints', 'form_data', 'check_history',
             'outreach_templates', 'outreach_blacklist', 'scheduler_campaign_locks'
+            , 'outreach_bases', 'outreach_base_contacts'
         ):
             try:
                 cursor.execute(f'UPDATE {table} SET tenant_id = ? WHERE tenant_id IS NULL', (default_tenant_id,))
@@ -252,6 +281,8 @@ def ensure_db_schema():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_data_tenant ON form_data(tenant_id, saved_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_check_history_tenant ON check_history(tenant_id, check_date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_templates_tenant ON outreach_templates(tenant_id, name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_bases_tenant ON outreach_bases(tenant_id, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_base_contacts_tenant ON outreach_base_contacts(tenant_id, base_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_stats_added_by ON account_stats(tenant_id, added_by_user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_campaigns_created_by ON outreach_campaigns(tenant_id, created_by_user_id)')
         cursor.execute("UPDATE users SET role = 'user' WHERE role = 'viewer'")
@@ -487,6 +518,18 @@ def get_campaign_for_current_user(campaign_id: int):
         if not cursor.fetchone():
             return None
     return campaign
+
+def get_base_for_current_user(base_id: int):
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    base = outreach.get_base(base_id, tenant_id=tenant_id)
+    if not base:
+        return None
+    if is_admin_user(user):
+        return base
+    if int(base.get('created_by_user_id') or 0) != int(user.get('id') or 0):
+        return None
+    return base
 
 def require_role(*allowed_roles):
     user = get_current_user()
@@ -870,6 +913,10 @@ def index():
 @app.route('/outreach')
 def outreach_page():
     return render_template('outreach.html')
+
+@app.route('/bases')
+def bases_page():
+    return render_template('bases.html')
 
 @app.route('/accounts')
 def accounts_page():
@@ -2551,6 +2598,158 @@ def delete_inactive_proxies():
 
 # ===== ЭНДПОИНТЫ ДЛЯ АУТРИЧА =====
 
+@app.route('/api/bases', methods=['GET'])
+def get_bases():
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    rows = outreach.get_bases(tenant_id=tenant_id)
+    if is_admin_user(user):
+        return jsonify(rows)
+    uid = int(user.get('id') or 0)
+    return jsonify([b for b in rows if int(b.get('created_by_user_id') or 0) == uid])
+
+@app.route('/api/bases', methods=['POST'])
+def create_base():
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Название базы обязательно'}), 400
+    base_id = outreach.create_base(
+        name=name,
+        tenant_id=tenant_id,
+        created_by_user_id=int(user.get('id') or 0) if not is_admin_user(user) else int(user.get('id') or 0)
+    )
+    return jsonify({'id': base_id, 'status': 'created'})
+
+@app.route('/api/bases/<int:base_id>', methods=['GET'])
+def get_base(base_id: int):
+    base = get_base_for_current_user(base_id)
+    if not base:
+        return jsonify({'error': 'Base not found'}), 404
+    return jsonify(base)
+
+@app.route('/api/bases/<int:base_id>', methods=['DELETE'])
+def delete_base(base_id: int):
+    base = get_base_for_current_user(base_id)
+    if not base:
+        return jsonify({'error': 'Base not found'}), 404
+    tenant_id = get_current_tenant_id()
+    outreach.delete_base(base_id=base_id, tenant_id=tenant_id)
+    return jsonify({'status': 'deleted', 'base_id': base_id})
+
+@app.route('/api/bases/<int:base_id>/contacts', methods=['GET'])
+def get_base_contacts(base_id: int):
+    base = get_base_for_current_user(base_id)
+    if not base:
+        return jsonify({'error': 'Base not found'}), 404
+    tenant_id = get_current_tenant_id()
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    return jsonify(outreach.get_base_contacts(base_id=base_id, limit=limit, offset=offset, tenant_id=tenant_id))
+
+@app.route('/api/bases/upload', methods=['POST'])
+def upload_base_contacts():
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+    file = request.files['file']
+    base_name = str(request.form.get('base_name') or '').strip()
+    if not base_name:
+        return jsonify({'error': 'base_name is required'}), 400
+
+    filename = secure_filename(file.filename or 'contacts.csv')
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    try:
+        validation = outreach.validate_contacts_file(filepath)
+        if not validation.get('ok'):
+            return jsonify({'error': validation.get('error') or 'Файл не прошёл валидацию'}), 400
+        base_id = outreach.create_base(
+            name=base_name,
+            tenant_id=tenant_id,
+            created_by_user_id=int(user.get('id') or 0)
+        )
+        result = outreach.import_contacts_to_base(base_id=base_id, file_path=filepath, tenant_id=tenant_id)
+        result['base_id'] = base_id
+        result['validation'] = validation
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+async def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
+    api_id, api_hash = get_api_credentials()
+    if not api_id or not api_hash:
+        raise RuntimeError('API credentials are not configured')
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT phone, session_name
+            FROM account_stats
+            WHERE tenant_id = ?
+              AND account_type = 'service'
+              AND COALESCE(is_banned, 0) = 0
+              AND COALESCE(is_frozen, 0) = 0
+            ORDER BY id DESC
+            LIMIT 1
+        ''', (tenant_id,))
+        row = cursor.fetchone()
+    if not row:
+        raise RuntimeError('Нет доступных service-сессий для парсинга')
+
+    session_name = row[1] or row[0]
+    session_path = os.path.join('sessions', session_name)
+    client = TelegramClient(session_path, int(api_id), api_hash)
+    await client.start()
+    try:
+        entity = await client.get_entity(chat_ref)
+        participants = await client.get_participants(entity, aggressive=False)
+        contacts = []
+        for p in participants:
+            username = getattr(p, 'username', None)
+            if not username:
+                continue
+            contacts.append({
+                'phone': None,
+                'username': username,
+                'access_hash': str(getattr(p, 'access_hash', '') or '') or None,
+                'name': ' '.join([x for x in [getattr(p, 'first_name', ''), getattr(p, 'last_name', '')] if x]).strip() or None,
+                'company': None,
+                'position': None,
+                'user_id': int(getattr(p, 'id', 0) or 0) or None
+            })
+        return contacts
+    finally:
+        await client.disconnect()
+
+@app.route('/api/bases/parse-chat', methods=['POST'])
+def parse_chat_to_base():
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    data = request.get_json(silent=True) or {}
+    chat_ref = str(data.get('chat') or '').strip()
+    base_name = str(data.get('base_name') or '').strip()
+    if not chat_ref:
+        return jsonify({'error': 'chat is required'}), 400
+    if not base_name:
+        return jsonify({'error': 'base_name is required'}), 400
+    try:
+        contacts = run_async(_parse_chat_members_with_service(tenant_id, chat_ref))
+        if not contacts:
+            return jsonify({'error': 'В чате не найдены участники с username'}), 400
+        base_id = outreach.create_base(name=base_name, tenant_id=tenant_id, created_by_user_id=int(user.get('id') or 0))
+        result = outreach.add_base_contacts(base_id=base_id, contacts=contacts, tenant_id=tenant_id, source_file=f'chat:{chat_ref}')
+        result['base_id'] = base_id
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
 @app.route('/api/outreach/campaigns', methods=['GET'])
 def get_outreach_campaigns():
     tenant_id = get_current_tenant_id()
@@ -2586,6 +2785,15 @@ def create_outreach_campaign():
         return jsonify({'error': 'Выберите минимум один активный outreach-аккаунт'}), 400
     strategy = data.get('strategy') or {'steps': []}
     schedule = data.get('schedule') or None
+    base_id_raw = data.get('base_id')
+    base_id = None
+    if base_id_raw not in (None, '', 0, '0'):
+        try:
+            base_id = int(base_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Некорректный base_id'}), 400
+        if not get_base_for_current_user(base_id):
+            return jsonify({'error': 'База не найдена'}), 404
     try:
         campaign_id = outreach.create_campaign(
             name=name,
@@ -2597,7 +2805,8 @@ def create_outreach_campaign():
             strategy=strategy,
             schedule=schedule,
             tenant_id=tenant_id,
-            created_by_user_id=actor_id if actor_id > 0 else None
+            created_by_user_id=actor_id if actor_id > 0 else None,
+            base_id=base_id
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -2623,6 +2832,15 @@ def update_outreach_campaign(campaign_id):
 
     schedule = data.get('schedule', campaign.get('schedule'))
     strategy = data.get('strategy', campaign.get('strategy') or {'steps': []})
+    base_id_raw = data.get('base_id', campaign.get('base_id'))
+    base_id = None
+    if base_id_raw not in (None, '', 0, '0'):
+        try:
+            base_id = int(base_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Некорректный base_id'}), 400
+        if not get_base_for_current_user(base_id):
+            return jsonify({'error': 'База не найдена'}), 404
     try:
         daily_limit = max(1, int(data.get('dailyLimit', campaign.get('daily_limit', 10))))
         delay_min = max(0, int(data.get('delayMin', campaign.get('delay_min', 5))))
@@ -2641,8 +2859,20 @@ def update_outreach_campaign(campaign_id):
             delay_max=delay_max,
             strategy=strategy,
             schedule=schedule,
-            tenant_id=tenant_id
+            tenant_id=tenant_id,
+            base_id=base_id
         )
+        if int(campaign.get('base_id') or 0) != int(base_id or 0):
+            with sqlite3.connect(db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM conversations WHERE tenant_id = ? AND campaign_id = ?', (tenant_id, campaign_id))
+                cursor.execute('DELETE FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ?', (tenant_id, campaign_id))
+                cursor.execute('''
+                    UPDATE outreach_campaigns
+                    SET total_contacts = 0, sent_count = 0, reply_count = 0, meeting_count = 0
+                    WHERE tenant_id = ? AND id = ?
+                ''', (tenant_id, campaign_id))
+                conn.commit()
     except Exception as e:
         return jsonify({'error': str(e)}), 400
     return jsonify({'status': 'updated', 'campaign': outreach.get_campaign(campaign_id, tenant_id=tenant_id)})
@@ -2708,6 +2938,10 @@ def get_outreach_blacklist():
         rows = cursor.fetchall()
     return jsonify([{'user_id': row[0], 'created_at': row[1]} for row in rows])
 
+@app.route('/api/bases/blacklist', methods=['GET'])
+def get_bases_blacklist():
+    return get_outreach_blacklist()
+
 @app.route('/api/outreach/blacklist', methods=['POST'])
 def add_to_outreach_blacklist():
     tenant_id = get_current_tenant_id()
@@ -2740,6 +2974,10 @@ def add_to_outreach_blacklist():
         'affected_contacts': affected_contacts
     })
 
+@app.route('/api/bases/blacklist', methods=['POST'])
+def add_to_bases_blacklist():
+    return add_to_outreach_blacklist()
+
 @app.route('/api/outreach/blacklist/<int:user_id>', methods=['DELETE'])
 def remove_from_outreach_blacklist(user_id: int):
     tenant_id = get_current_tenant_id()
@@ -2771,6 +3009,10 @@ def remove_from_outreach_blacklist(user_id: int):
         'restored_contacts': restored_contacts
     })
 
+@app.route('/api/bases/blacklist/<int:user_id>', methods=['DELETE'])
+def remove_from_bases_blacklist(user_id: int):
+    return remove_from_outreach_blacklist(user_id)
+
 @app.route('/api/outreach/campaign/<int:campaign_id>/start', methods=['POST'])
 def start_campaign(campaign_id):
     tenant_id = get_current_tenant_id()
@@ -2795,8 +3037,21 @@ def start_campaign(campaign_id):
             delay_max=int(campaign.get('delay_max') or 15),
             strategy=campaign.get('strategy') or {'steps': []},
             schedule=campaign.get('schedule'),
-            tenant_id=tenant_id
+            tenant_id=tenant_id,
+            base_id=campaign.get('base_id')
         )
+
+    base_id = campaign.get('base_id')
+    if not base_id:
+        return jsonify({'error': 'Для кампании не выбрана база контактов'}), 400
+    if not get_base_for_current_user(int(base_id)):
+        return jsonify({'error': 'Выбранная база недоступна'}), 400
+    outreach.sync_campaign_contacts_from_base(
+        campaign_id=campaign_id,
+        base_id=int(base_id),
+        tenant_id=tenant_id,
+        reset=False
+    )
 
     with sqlite3.connect(db.db_path) as conn:
         cursor = conn.cursor()
@@ -2878,13 +3133,21 @@ def campaign_readiness(campaign_id):
               AND (user_id IS NOT NULL OR (username IS NOT NULL AND username != '') OR (phone IS NOT NULL AND phone != ''))
         ''', (campaign_id, tenant_id, tenant_id))
         new_contacts = cursor.fetchone()[0]
+        base_contacts_total = 0
+        base_id = int(campaign.get('base_id') or 0)
+        if base_id > 0:
+            cursor.execute(
+                'SELECT COUNT(*) FROM outreach_base_contacts WHERE tenant_id = ? AND base_id = ?',
+                (tenant_id, base_id)
+            )
+            base_contacts_total = cursor.fetchone()[0] or 0
 
     api_id, api_hash = get_api_credentials()
     has_api = bool(api_id and api_hash)
     valid_accounts = filter_valid_outreach_accounts(campaign.get('accounts') or [])
     has_accounts = bool(valid_accounts)
-    has_contacts = bool((contacts_total or 0) > 0)
-    has_targets = bool((new_contacts or 0) > 0)
+    has_contacts = bool((contacts_total or 0) > 0 or (base_contacts_total or 0) > 0)
+    has_targets = bool((new_contacts or 0) > 0 or (base_contacts_total or 0) > 0)
     scheduler_running = is_scheduler_running()
 
     now = datetime.now()
@@ -2927,6 +3190,8 @@ def campaign_readiness(campaign_id):
         'contacts_with_username': contacts_with_username or 0,
         'contacts_with_phone': contacts_with_phone or 0,
         'contacts_blacklisted': blacklisted_contacts,
+        'base_id': campaign.get('base_id'),
+        'base_contacts_total': int(base_contacts_total or 0),
         'new_contacts_ready': new_contacts or 0,
         'schedule_open_now': schedule_open,
         'schedule_reason': schedule_reason,
@@ -3215,7 +3480,10 @@ def update_account_type(phone):
     user = get_current_user() or {}
     user_id = int(user.get('id') or 0)
     
-    if account_type not in ['checker', 'outreach']:
+    allowed_types = ['checker', 'outreach']
+    if is_admin_user(user):
+        allowed_types.append('service')
+    if account_type not in allowed_types:
         return jsonify({'error': 'Invalid account type'}), 400
     
     try:

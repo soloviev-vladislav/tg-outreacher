@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Базы</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link">Проверка</a>
+            <a href="/outreach" class="nav-link">Рассылки</a>
+            <a href="/bases" class="nav-link active">Базы</a>
+            <a href="/accounts" class="nav-link">Аккаунты</a>
+            <a href="/proxies" class="nav-link">Прокси</a>
+            {% if current_user and current_user.role == 'admin' %}
+            <a href="/users" class="nav-link">Пользователи</a>
+            {% endif %}
+        </div>
+
+        <h1 class="page-title">Базы</h1>
+
+        <div class="grid-2" style="margin-bottom: 18px;">
+            <div class="card">
+                <h2 class="section-title">Импорт базы</h2>
+                <div class="muted-text" style="margin-bottom: 10px; font-size: 12px;">
+                    Файл CSV/XLSX с колонками: минимум <code>user_id</code> или <code>username</code> или <code>phone</code>.
+                    Дополнительно: <code>name</code>, <code>company</code>, <code>position</code>.
+                </div>
+                <div class="form-group">
+                    <label>Название базы</label>
+                    <input id="baseNameInput" type="text" class="form-control" placeholder="Например: Founders март">
+                </div>
+                <div class="upload-area" id="baseUploadArea">
+                    <div>Перетащите файл сюда или нажмите для выбора</div>
+                    <small>CSV/Excel</small>
+                </div>
+                <input type="file" id="baseFileInput" accept=".csv,.xlsx,.xls" style="display:none">
+                <div id="baseUploadStatus" class="muted-text" style="margin-top: 10px;"></div>
+            </div>
+
+            <div class="card">
+                <h2 class="section-title">Парсинг участников чата</h2>
+                <div class="muted-text" style="margin-bottom: 10px; font-size: 12px;">
+                    Укажите ссылку/username чата с открытыми участниками. В базу попадут только участники с <code>username</code>.
+                </div>
+                <div class="form-group">
+                    <label>Ссылка на чат</label>
+                    <input id="parseChatInput" type="text" class="form-control" placeholder="https://t.me/username или @username">
+                </div>
+                <div class="form-group">
+                    <label>Название новой базы</label>
+                    <input id="parseBaseNameInput" type="text" class="form-control" placeholder="Например: Парсинг aihubco">
+                </div>
+                <div class="btn-group">
+                    <button id="parseChatBtn" class="btn btn-primary">Запустить парсинг</button>
+                </div>
+                <div id="parseChatStatus" class="muted-text" style="margin-top: 10px;"></div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom: 18px;">
+            <div class="panel-head">
+                <h2 class="section-title" style="margin:0;">Черный список user_id</h2>
+                <div class="btn-group">
+                    <input id="blacklistUserIdInput" type="number" class="form-control" placeholder="user_id" style="max-width: 180px;">
+                    <button id="addBlacklistBtn" class="btn btn-small">Добавить</button>
+                </div>
+            </div>
+            <div id="blacklistList" class="templates-list" style="margin-top: 10px;"></div>
+        </div>
+
+        <div class="card">
+            <div class="panel-head">
+                <h2 class="section-title" style="margin:0;">Список баз</h2>
+                <button id="reloadBasesBtn" class="btn btn-small">Обновить</button>
+            </div>
+            <div id="basesList" style="margin-top: 12px;">
+                <div class="empty-state">Загрузка...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/bases.js"></script>
+</body>
+</html>

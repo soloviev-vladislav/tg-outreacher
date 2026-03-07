@@ -4,8 +4,7 @@ let accounts = [];
 let selectedCampaignAccounts = new Set();
 let templates = [];
 let refreshTimer = null;
-let blacklistRows = [];
-let blacklistSet = new Set();
+let bases = [];
 let contactsPage = 1;
 const CONTACTS_PAGE_SIZE = 100;
 
@@ -13,7 +12,7 @@ const SELECTED_CAMPAIGN_KEY = 'outreach_selected_campaign_id';
 
 document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
-    await Promise.all([loadAccounts(), loadTemplates(), loadCampaigns(), loadBlacklist()]);
+    await Promise.all([loadAccounts(), loadTemplates(), loadBases(), loadCampaigns()]);
     restoreSelectedCampaign();
     startAutoRefresh();
 });
@@ -32,41 +31,23 @@ function setupEventListeners() {
     document.getElementById('clearCampaignAccountsBtn')?.addEventListener('click', clearCampaignAccounts);
 
     document.getElementById('addFollowupStepBtn')?.addEventListener('click', () => addFollowupStep());
-    document.getElementById('addBlacklistBtn')?.addEventListener('click', addBlacklistFromInput);
-    document.getElementById('blacklistUserIdInput')?.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') addBlacklistFromInput();
+    document.getElementById('campaignBaseId')?.addEventListener('change', () => {
+        const baseIdRaw = document.getElementById('campaignBaseId')?.value || '';
+        const baseId = Number(baseIdRaw);
+        const selected = bases.find(b => b.id === baseId);
+        const info = selected
+            ? `База: ${selected.name} · контактов ${selected.contacts_count || 0}`
+            : 'База не выбрана';
+        showSaveStatus(info);
     });
     document.getElementById('exportStepReportCsvBtn')?.addEventListener('click', () => exportStepReport('csv'));
     document.getElementById('exportStepReportXlsxBtn')?.addEventListener('click', () => exportStepReport('xlsx'));
-
-    const uploadArea = document.getElementById('uploadArea');
-    const fileInput = document.getElementById('fileInput');
-    if (uploadArea && fileInput) {
-        uploadArea.addEventListener('click', () => fileInput.click());
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        });
-        uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file) uploadFile(file);
-        });
-        fileInput.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (file) uploadFile(file);
-            fileInput.value = '';
-        });
-    }
 }
 
 function startAutoRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(async () => {
         await loadCampaigns();
-        await loadBlacklist();
         if (currentCampaignId) {
             const campaign = campaigns.find(c => c.id === currentCampaignId);
             if (campaign) {
@@ -111,73 +92,30 @@ async function loadAccounts() {
     renderCampaignAccountsSelector();
 }
 
-async function loadBlacklist() {
+async function loadBases() {
     try {
-        const response = await fetch('/api/outreach/blacklist');
-        const rows = await response.json();
-        blacklistRows = Array.isArray(rows) ? rows : [];
-        blacklistSet = new Set(blacklistRows.map(r => Number(r.user_id)).filter(n => Number.isFinite(n)));
-        renderBlacklist();
+        const response = await fetch('/api/bases');
+        const data = await response.json();
+        bases = Array.isArray(data) ? data : [];
+        renderBaseSelector();
     } catch (e) {
-        console.error('Failed to load blacklist', e);
+        console.error('Failed to load bases', e);
+        bases = [];
+        renderBaseSelector();
     }
 }
 
-function renderBlacklist() {
-    const container = document.getElementById('blacklistList');
-    if (!container) return;
-    if (!Array.isArray(blacklistRows) || blacklistRows.length === 0) {
-        container.innerHTML = '<small class="muted-text">Черный список пуст</small>';
-        return;
+function renderBaseSelector(selectedBaseId = null) {
+    const select = document.getElementById('campaignBaseId');
+    if (!select) return;
+    const selected = Number(selectedBaseId || select.value || 0);
+    const options = ['<option value="">Выберите базу</option>'];
+    for (const b of bases) {
+        const hint = `(${b.contacts_count || 0})`;
+        const sel = Number(b.id) === selected ? 'selected' : '';
+        options.push(`<option value="${escapeHtml(String(b.id))}" ${sel}>${escapeHtml(b.name)} ${hint}</option>`);
     }
-    container.innerHTML = blacklistRows.map(row => `
-        <span class="template-tag" style="display:inline-flex; align-items:center; gap:6px;">
-            ${escapeHtml(String(row.user_id))}
-            <button class="btn btn-small remove-blacklist" data-user-id="${escapeHtml(String(row.user_id))}">×</button>
-        </span>
-    `).join('');
-    container.querySelectorAll('.remove-blacklist').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.preventDefault();
-            const uid = Number(btn.dataset.userId);
-            if (!Number.isFinite(uid)) return;
-            await removeFromBlacklist(uid);
-        });
-    });
-}
-
-async function addBlacklistFromInput() {
-    const input = document.getElementById('blacklistUserIdInput');
-    if (!input) return;
-    const uid = Number(input.value);
-    if (!Number.isFinite(uid) || uid <= 0) {
-        showSaveStatus('Введите корректный user_id', true);
-        return;
-    }
-    const response = await fetch('/api/outreach/blacklist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: uid })
-    });
-    const data = await response.json();
-    if (!response.ok || data.error) {
-        showSaveStatus(data.error || 'Ошибка добавления в blacklist', true);
-        return;
-    }
-    input.value = '';
-    await Promise.all([loadBlacklist(), currentCampaignId ? loadContacts(currentCampaignId) : Promise.resolve()]);
-    showSaveStatus(`user_id ${uid} добавлен в blacklist`);
-}
-
-async function removeFromBlacklist(userId) {
-    const response = await fetch(`/api/outreach/blacklist/${encodeURIComponent(userId)}`, { method: 'DELETE' });
-    const data = await response.json();
-    if (!response.ok || data.error) {
-        showSaveStatus(data.error || 'Ошибка удаления из blacklist', true);
-        return;
-    }
-    await Promise.all([loadBlacklist(), currentCampaignId ? loadContacts(currentCampaignId) : Promise.resolve()]);
-    showSaveStatus(`user_id ${userId} удален из blacklist`);
+    select.innerHTML = options.join('');
 }
 
 function campaignsUsingAccount(phone, excludeCampaignId = null) {
@@ -343,6 +281,7 @@ function newCampaign() {
 
     document.getElementById('campaignName').value = '';
     document.getElementById('messageTemplate').value = '';
+    renderBaseSelector(null);
     document.getElementById('dailyLimit').value = '20';
     document.getElementById('delayMin').value = '5';
     document.getElementById('delayMax').value = '15';
@@ -371,7 +310,9 @@ function newCampaign() {
     document.getElementById('stopCampaignBtn').disabled = true;
     document.getElementById('deleteCampaignBtn').disabled = true;
 
-    document.getElementById('contactsList').innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">Сначала сохраните кампанию</td></tr>';
+    document.getElementById('contactsList').innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">Сначала сохраните кампанию</td></tr>';
+    const head = document.getElementById('contactsHead');
+    if (head) head.innerHTML = '';
     const pagination = document.getElementById('contactsPagination');
     if (pagination) pagination.innerHTML = '';
     document.getElementById('contactsStats').textContent = '';
@@ -383,6 +324,7 @@ function newCampaign() {
 function populateCampaignForm(campaign) {
     document.getElementById('campaignName').value = campaign.name || '';
     document.getElementById('messageTemplate').value = campaign.message_template || '';
+    renderBaseSelector(campaign.base_id || null);
     document.getElementById('dailyLimit').value = campaign.daily_limit || 20;
     document.getElementById('delayMin').value = campaign.delay_min ?? 5;
     document.getElementById('delayMax').value = campaign.delay_max ?? 15;
@@ -539,9 +481,13 @@ function collectCampaignPayload() {
     const template = document.getElementById('messageTemplate').value.trim();
     const selectedAccounts = Array.from(selectedCampaignAccounts);
 
+    const baseIdRaw = document.getElementById('campaignBaseId')?.value || '';
+    const baseId = baseIdRaw ? Number(baseIdRaw) : null;
+
     return {
         name,
         template,
+        base_id: Number.isFinite(baseId) && baseId > 0 ? baseId : null,
         accounts: selectedAccounts,
         dailyLimit: parseInt(document.getElementById('dailyLimit').value, 10) || 20,
         delayMin: parseInt(document.getElementById('delayMin').value, 10) || 0,
@@ -559,6 +505,10 @@ async function saveCampaign() {
     }
     if (!payload.template) {
         showSaveStatus('Введите текст первого сообщения', true);
+        return;
+    }
+    if (!payload.base_id) {
+        showSaveStatus('Выберите базу контактов', true);
         return;
     }
     if (!currentCampaignId && !payload.accounts.length) {
@@ -649,31 +599,13 @@ async function previewSpintax() {
     }
 }
 
-async function uploadFile(file) {
-    if (!currentCampaignId) {
-        showSaveStatus('Сначала сохраните кампанию', true);
-        return;
-    }
-
-    const progress = document.getElementById('uploadProgress');
-    progress.textContent = 'Загрузка...';
-
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('campaign_id', currentCampaignId);
-
-    const response = await fetch('/api/outreach/upload', { method: 'POST', body: formData });
-    const result = await response.json();
-
-    if (result.error) {
-        progress.textContent = `Ошибка: ${result.error}`;
-        return;
-    }
-
-    const v = result.validation || {};
-    const validationText = v.rows_total ? ` · валидно строк: ${v.rows_valid}/${v.rows_total}` : '';
-    progress.textContent = `Загружено: ${result.imported}, пропущено: ${result.skipped}${validationText}`;
-    await Promise.all([loadCampaigns(), loadContacts(currentCampaignId), refreshReadiness(currentCampaignId)]);
+function contactStatusClass(status) {
+    const st = String(status || '').toLowerCase();
+    if (st === 'replied') return 'badge-success';
+    if (st === 'sent') return 'badge';
+    if (st === 'ignored') return 'badge-warning';
+    if (st === 'failed') return 'badge-danger';
+    return 'badge';
 }
 
 async function loadContacts(campaignId) {
@@ -699,51 +631,40 @@ async function loadContacts(campaignId) {
         return loadContacts(campaignId);
     }
     if (!Array.isArray(contacts) || contacts.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">Контактов пока нет</td></tr>';
+        const head = document.getElementById('contactsHead');
+        if (head) head.innerHTML = '';
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">Контактов пока нет</td></tr>';
         document.getElementById('contactsStats').textContent =
             `Всего ${total} · new ${Number(statusCounts.new || 0)} · sent ${Number(statusCounts.sent || 0)} · ignored ${Number(statusCounts.ignored || 0)} · replied ${Number(statusCounts.replied || 0)} · failed ${Number(statusCounts.failed || 0)}`;
         renderContactsPagination(total);
         return;
     }
 
+    const hasCompany = contacts.some(c => (c.company || '').trim().length > 0);
+    const hasPosition = contacts.some(c => (c.position || '').trim().length > 0);
+    const hasAccountUsed = contacts.some(c => (c.account_used || '').trim().length > 0);
+    const head = document.getElementById('contactsHead');
+    if (head) {
+        const cols = ['<th>Статус</th>', '<th>Контакт</th>', '<th>Шаг</th>'];
+        if (hasCompany) cols.push('<th>Компания</th>');
+        if (hasPosition) cols.push('<th>Должность</th>');
+        if (hasAccountUsed) cols.push('<th>Аккаунт</th>');
+        head.innerHTML = `<tr>${cols.join('')}</tr>`;
+    }
+
     tbody.innerHTML = contacts.map(c => `
         <tr>
-            <td><span class="badge ${statusBadgeClass(c.status)}">${escapeHtml(c.status)}</span></td>
+            <td><span class="badge ${contactStatusClass(c.status)}">${escapeHtml(c.status)}</span></td>
             <td>
                 <strong>${escapeHtml(c.name || '—')}</strong><br>
                 <small>${escapeHtml(c.phone || '—')} ${c.username ? '@' + escapeHtml(c.username) : ''} ${c.user_id ? `(ID: ${c.user_id})` : ''}</small>
             </td>
             <td><small>${renderContactStepInfo(c, campaign)}</small></td>
-            <td>${escapeHtml(c.company || '-')}<br><small>${escapeHtml(c.position || '-')}</small></td>
-            <td>${escapeHtml(c.account_used || '—')}</td>
-            <td><small>${escapeHtml(c.notes || '')}</small></td>
-            <td>
-                ${c.user_id
-                    ? (blacklistSet.has(Number(c.user_id))
-                        ? '<small class="muted-text">в blacklist</small>'
-                        : `<button class="btn btn-small add-blacklist-row" data-user-id="${escapeHtml(String(c.user_id))}">В blacklist</button>`)
-                    : '<small class="muted-text">—</small>'}
-            </td>
+            ${hasCompany ? `<td>${escapeHtml(c.company || '-')}</td>` : ''}
+            ${hasPosition ? `<td>${escapeHtml(c.position || '-')}</td>` : ''}
+            ${hasAccountUsed ? `<td>${escapeHtml(c.account_used || '—')}</td>` : ''}
         </tr>
     `).join('');
-
-    tbody.querySelectorAll('.add-blacklist-row').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const uid = Number(btn.dataset.userId);
-            if (!Number.isFinite(uid)) return;
-            const response = await fetch('/api/outreach/blacklist', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ user_id: uid })
-            });
-            const data = await response.json();
-            if (!response.ok || data.error) {
-                showSaveStatus(data.error || 'Ошибка добавления в blacklist', true);
-                return;
-            }
-            await Promise.all([loadBlacklist(), loadContacts(campaignId)]);
-        });
-    });
     renderContactsPagination(total);
 
     document.getElementById('contactsStats').textContent =

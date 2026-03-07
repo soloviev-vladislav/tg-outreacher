@@ -11,6 +11,7 @@
         <div class="nav-bar">
             <a href="/" class="nav-link">Проверка</a>
             <a href="/outreach" class="nav-link active">Рассылки</a>
+            <a href="/bases" class="nav-link">Базы</a>
             <a href="/accounts" class="nav-link">Аккаунты</a>
             <a href="/proxies" class="nav-link">Прокси</a>
             {% if current_user and current_user.role == 'admin' %}
@@ -21,7 +22,7 @@
         <h1 class="page-title">Рассылки</h1>
 
         <div class="card" style="margin-bottom: 20px;">
-            <strong>Как работать:</strong> создайте или выберите кампанию, сохраните настройки, загрузите контакты, затем запустите кампанию.
+            <strong>Как работать:</strong> создайте или выберите кампанию, назначьте базу из раздела <code>Базы</code>, сохраните и запустите.
             В рассылке участвуют только аккаунты с типом <code>outreach</code>.
         </div>
 
@@ -53,6 +54,12 @@
                 <div class="form-group">
                     <label>Название кампании</label>
                     <input type="text" id="campaignName" placeholder="Например: B2B SaaS февраль">
+                </div>
+
+                <div class="form-group">
+                    <label>База контактов</label>
+                    <select id="campaignBaseId" class="form-control"></select>
+                    <small class="form-hint">Загрузка/удаление баз и черный список находятся на странице <code>Базы</code>.</small>
                 </div>
 
                 <div class="form-group">
@@ -142,21 +149,6 @@
                 <div id="followupSteps" class="followup-steps"></div>
 
                 <div class="section-divider"></div>
-                <div class="panel-head">
-                    <h3 class="sub-title" style="margin: 0;">База контактов</h3>
-                    <div id="uploadProgress" class="muted-text"></div>
-                </div>
-                <div class="muted-text" style="margin-bottom: 8px; font-size: 12px;">
-                    Формат файла: минимум одна из колонок <code>user_id</code>/<code>username</code>/<code>phone</code>.
-                    Дополнительно можно <code>name</code>, <code>company</code>, <code>position</code>.
-                </div>
-                <div class="upload-area" id="uploadArea">
-                    <div>Перетащите файл сюда или нажмите для выбора</div>
-                    <small>CSV/Excel: <code>user_id</code>, <code>username</code> или <code>phone</code></small>
-                </div>
-                <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" style="display:none">
-
-                <div class="section-divider"></div>
                 <div class="btn-group wrap">
                     <button id="saveCampaignBtn" class="btn btn-primary">Сохранить настройки</button>
                     <button id="startCampaignBtn" class="btn btn-success" disabled>Запустить</button>
@@ -170,15 +162,6 @@
         </div>
 
         <div style="margin-top: 24px;">
-            <div class="panel-head" style="margin-bottom: 8px;">
-                <h2 class="section-title" style="margin:0;">Черный список user_id</h2>
-                <div class="btn-group">
-                    <input id="blacklistUserIdInput" type="number" class="form-control" placeholder="user_id" style="max-width: 160px;">
-                    <button id="addBlacklistBtn" class="btn btn-small">Добавить</button>
-                </div>
-            </div>
-            <div id="blacklistList" class="templates-list" style="margin-bottom: 18px;"></div>
-
             <h2 class="section-title">Контакты кампании</h2>
             <div class="btn-group" style="margin-bottom: 8px;">
                 <button id="exportStepReportCsvBtn" class="btn btn-small">Экспорт отчета шагов CSV</button>
@@ -186,19 +169,9 @@
             </div>
             <div class="table-container contacts-table-scroll">
                 <table>
-                    <thead>
-                        <tr>
-                            <th>Статус</th>
-                            <th>Контакт</th>
-                            <th>Шаг</th>
-                            <th>Компания</th>
-                            <th>Аккаунт</th>
-                            <th>Примечание</th>
-                            <th>Действия</th>
-                        </tr>
-                    </thead>
+                    <thead id="contactsHead"></thead>
                     <tbody id="contactsList">
-                        <tr><td colspan="7" style="text-align:center; padding: 30px;">Выберите кампанию</td></tr>
+                        <tr><td colspan="6" style="text-align:center; padding: 30px;">Выберите кампанию</td></tr>
                     </tbody>
                 </table>
             </div>

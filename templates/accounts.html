@@ -11,6 +11,7 @@
         <div class="nav-bar">
             <a href="/" class="nav-link">Проверка</a>
             <a href="/outreach" class="nav-link">Рассылки</a>
+            <a href="/bases" class="nav-link">Базы</a>
             <a href="/accounts" class="nav-link active">Аккаунты</a>
             <a href="/proxies" class="nav-link">Прокси</a>
             {% if current_user and current_user.role == 'admin' %}
@@ -58,6 +59,9 @@
                     <option value="">Все типы</option>
                     <option value="checker">Checker</option>
                     <option value="outreach">Outreach</option>
+                    {% if current_user and current_user.role == 'admin' %}
+                    <option value="service">Service</option>
+                    {% endif %}
                 </select>
                 <select id="statusFilter" class="form-control">
                     <option value="">Все статусы</option>
@@ -127,6 +131,9 @@
                 <select id="newType" class="form-control">
                     <option value="checker">Checker</option>
                     <option value="outreach">Outreach</option>
+                    {% if current_user and current_user.role == 'admin' %}
+                    <option value="service">Service</option>
+                    {% endif %}
                 </select>
             </div>
             
@@ -158,6 +165,7 @@
     </div>
 
     <script>
+        const IS_ADMIN = {{ 'true' if current_user and current_user.role == 'admin' else 'false' }};
         let accounts = [];
         let selectedAccounts = new Set();
         let proxies = [];
@@ -201,7 +209,7 @@
                 <tr onclick="toggleRowSelection(event, '${a.phone}')" style="cursor:pointer;">
                     <td onclick="event.stopPropagation()"><input type="checkbox" value="${a.phone}" ${checked} onchange="setSelected('${a.phone}', this.checked)"></td>
                     <td><strong>${a.phone || 'Неизвестно'}</strong></td>
-                    <td><span class="badge ${a.account_type === 'outreach' ? 'badge-success' : ''}">${a.account_type}</span></td>
+                    <td><span class="badge ${a.account_type === 'outreach' ? 'badge-success' : (a.account_type === 'service' ? 'badge-warning' : '')}">${a.account_type}</span></td>
                     <td><span class="badge ${a.is_frozen ? 'badge-danger' : a.is_banned ? 'badge-warning' : 'badge-success'}">
                         ${a.is_frozen ? 'Frozen' : a.is_banned ? 'Бан' : 'Активен'}
                     </span></td>

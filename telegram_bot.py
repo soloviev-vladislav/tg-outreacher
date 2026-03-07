@@ -245,6 +245,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tenant_id INTEGER DEFAULT 1,
                     created_by_user_id INTEGER,
+                    base_id INTEGER,
                     name TEXT NOT NULL,
                     message_template TEXT NOT NULL,
                     accounts TEXT DEFAULT '[]',
@@ -264,6 +265,36 @@ class Database:
                     ai_tone TEXT DEFAULT 'professional',
                     schedule TEXT,
                     UNIQUE(name)
+                )
+            ''')
+
+            # Базы контактов (общие для всех кампаний пользователя)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS outreach_bases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
+                    created_by_user_id INTEGER,
+                    name TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Контакты в базе (не содержат служебные статусы кампаний)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS outreach_base_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
+                    base_id INTEGER NOT NULL,
+                    phone TEXT,
+                    username TEXT,
+                    access_hash TEXT,
+                    name TEXT,
+                    company TEXT,
+                    position TEXT,
+                    source_file TEXT,
+                    user_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(base_id) REFERENCES outreach_bases(id)
                 )
             ''')
             
@@ -336,10 +367,12 @@ class Database:
                 'account_fingerprints': {'tenant_id': 'INTEGER DEFAULT 1'},
                 'conversations': {'tenant_id': 'INTEGER DEFAULT 1'},
                 'scheduler_campaign_locks': {'tenant_id': 'INTEGER DEFAULT 1'},
-                'outreach_campaigns': {'tenant_id': 'INTEGER DEFAULT 1', 'created_by_user_id': 'INTEGER'},
+                'outreach_campaigns': {'tenant_id': 'INTEGER DEFAULT 1', 'created_by_user_id': 'INTEGER', 'base_id': 'INTEGER'},
                 'outreach_contacts': {'tenant_id': 'INTEGER DEFAULT 1'},
                 'outreach_templates': {'tenant_id': 'INTEGER DEFAULT 1'},
-                'outreach_blacklist': {'tenant_id': 'INTEGER DEFAULT 1'}
+                'outreach_blacklist': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'outreach_bases': {'tenant_id': 'INTEGER DEFAULT 1', 'created_by_user_id': 'INTEGER'},
+                'outreach_base_contacts': {'tenant_id': 'INTEGER DEFAULT 1'}
             }
             for table_name, cols in schema_additions.items():
                 try:
@@ -358,6 +391,8 @@ class Database:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_campaigns_tenant ON outreach_campaigns(tenant_id, status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_contacts_tenant ON outreach_contacts(tenant_id, campaign_id, status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id, campaign_id, contact_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_bases_tenant ON outreach_bases(tenant_id, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_base_contacts_tenant ON outreach_base_contacts(tenant_id, base_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_stats_tenant ON account_stats(tenant_id, phone)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_proxies_tenant ON proxies(tenant_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_check_history_tenant ON check_history(tenant_id, check_date)')
@@ -376,7 +411,8 @@ class Database:
                 'check_history', 'account_stats', 'form_data', 'proxies',
                 'account_fingerprints', 'conversations', 'scheduler_campaign_locks',
                 'outreach_campaigns', 'outreach_contacts', 'outreach_messages',
-                'outreach_templates', 'outreach_blacklist'
+                'outreach_templates', 'outreach_blacklist',
+                'outreach_bases', 'outreach_base_contacts'
             ):
                 try:
                     cursor.execute(f'UPDATE {table} SET tenant_id = ? WHERE tenant_id IS NULL', (default_tenant_id,))
@@ -749,7 +785,8 @@ class OutreachManager:
     def create_campaign(self, name: str, message_template: str, accounts: List[str], 
                        daily_limit: int = 10, delay_min: int = 5, delay_max: int = 15,
                        strategy: Optional[dict] = None, schedule: Optional[dict] = None,
-                       tenant_id: int = 1, created_by_user_id: Optional[int] = None):
+                       tenant_id: int = 1, created_by_user_id: Optional[int] = None,
+                       base_id: Optional[int] = None):
         """Создание новой кампании"""
         strategy_json = json.dumps(strategy or {"steps": []})
         schedule_json = json.dumps(schedule) if schedule else None
@@ -757,16 +794,16 @@ class OutreachManager:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO outreach_campaigns 
-                (tenant_id, created_by_user_id, name, message_template, accounts, daily_limit, delay_min, delay_max, strategy, schedule)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (tenant_id, created_by_user_id, name, message_template, json.dumps(accounts), daily_limit, delay_min, delay_max, strategy_json, schedule_json))
+                (tenant_id, created_by_user_id, base_id, name, message_template, accounts, daily_limit, delay_min, delay_max, strategy, schedule)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (tenant_id, created_by_user_id, base_id, name, message_template, json.dumps(accounts), daily_limit, delay_min, delay_max, strategy_json, schedule_json))
             conn.commit()
             return cursor.lastrowid
 
     def update_campaign(self, campaign_id: int, name: str, message_template: str, accounts: List[str],
                         daily_limit: int, delay_min: int, delay_max: int,
                         strategy: Optional[dict] = None, schedule: Optional[dict] = None,
-                        tenant_id: int = 1):
+                        tenant_id: int = 1, base_id: Optional[int] = None):
         """Обновление основных настроек кампании"""
         strategy_json = json.dumps(strategy or {"steps": []})
         schedule_json = json.dumps(schedule) if schedule else None
@@ -775,7 +812,7 @@ class OutreachManager:
             cursor.execute('''
                 UPDATE outreach_campaigns
                 SET name = ?, message_template = ?, accounts = ?, daily_limit = ?,
-                    delay_min = ?, delay_max = ?, strategy = ?, schedule = ?
+                    delay_min = ?, delay_max = ?, strategy = ?, schedule = ?, base_id = ?
                 WHERE id = ? AND tenant_id = ?
             ''', (
                 name,
@@ -786,6 +823,7 @@ class OutreachManager:
                 delay_max,
                 strategy_json,
                 schedule_json,
+                base_id,
                 campaign_id,
                 tenant_id
             ))
@@ -801,7 +839,7 @@ class OutreachManager:
                     SELECT id, name, message_template, accounts, daily_limit, 
                            delay_min, delay_max, status, created_at, started_at,
                            total_contacts, sent_count, reply_count, meeting_count,
-                           strategy, ai_enabled, ai_tone, schedule
+                           strategy, ai_enabled, ai_tone, schedule, base_id
                     FROM outreach_campaigns
                     WHERE tenant_id = ?
                     ORDER BY created_at DESC
@@ -812,7 +850,7 @@ class OutreachManager:
                     SELECT id, name, message_template, accounts, daily_limit, 
                            delay_min, delay_max, status, created_at, started_at,
                            total_contacts, sent_count, reply_count, meeting_count,
-                           strategy, ai_enabled, ai_tone
+                           strategy, ai_enabled, ai_tone, base_id
                     FROM outreach_campaigns
                     WHERE tenant_id = ?
                     ORDER BY created_at DESC
@@ -839,6 +877,7 @@ class OutreachManager:
                     'ai_enabled': bool(row[15]),
                     'ai_tone': row[16],
                     'schedule': json.loads(row[17]) if has_schedule and len(row) > 17 and row[17] else None,
+                    'base_id': row[18] if has_schedule else row[17],
                     'progress': round(row[11]/row[10]*100 if row[10] > 0 else 0)
                 })
             return campaigns
@@ -853,7 +892,7 @@ class OutreachManager:
                     SELECT id, name, message_template, accounts, daily_limit, 
                            delay_min, delay_max, status, created_at, started_at,
                            total_contacts, sent_count, reply_count, meeting_count,
-                           strategy, ai_enabled, ai_tone, schedule
+                           strategy, ai_enabled, ai_tone, schedule, base_id
                     FROM outreach_campaigns WHERE id = ? AND tenant_id = ?
                 ''', (campaign_id, tenant_id))
             except sqlite3.OperationalError:
@@ -862,7 +901,7 @@ class OutreachManager:
                     SELECT id, name, message_template, accounts, daily_limit, 
                            delay_min, delay_max, status, created_at, started_at,
                            total_contacts, sent_count, reply_count, meeting_count,
-                           strategy, ai_enabled, ai_tone
+                           strategy, ai_enabled, ai_tone, base_id
                     FROM outreach_campaigns WHERE id = ? AND tenant_id = ?
                 ''', (campaign_id, tenant_id))
             row = cursor.fetchone()
@@ -885,7 +924,8 @@ class OutreachManager:
                     'strategy': json.loads(row[14]) if row[14] else {"steps": []},
                     'ai_enabled': bool(row[15]),
                     'ai_tone': row[16],
-                    'schedule': json.loads(row[17]) if has_schedule and len(row) > 17 and row[17] else None
+                    'schedule': json.loads(row[17]) if has_schedule and len(row) > 17 and row[17] else None,
+                    'base_id': row[18] if has_schedule else row[17]
                 }
             return None
 
@@ -998,6 +1038,297 @@ class OutreachManager:
                 'username': username_col
             }
         }
+
+    def _collect_contacts_rows_from_df(self, df: pd.DataFrame) -> List[dict]:
+        """Нормализация DataFrame контактов в единый список строк."""
+        rows: List[dict] = []
+        df.columns = [str(col).lower().strip() for col in df.columns]
+
+        phone_col = next((col for col in df.columns if 'phone' in col or 'tel' in col or 'номер' in col), None)
+        name_col = next((col for col in df.columns if 'name' in col or 'имя' in col), None)
+        company_col = next((col for col in df.columns if 'company' in col or 'компан' in col), None)
+        position_col = next((col for col in df.columns if 'position' in col or 'должн' in col or 'role' in col), None)
+        user_id_col = next((col for col in df.columns if 'user_id' in col or 'userid' in col or 'telegram_id' in col or 'tg_id' in col), None)
+        username_col = next((col for col in df.columns if col in ['username', 'telegram_username', 'tg_username']), None)
+        access_hash_col = next((col for col in df.columns if 'access_hash' in col or 'user_hash' in col), None)
+
+        for _, row in df.iterrows():
+            phone = None
+            user_id = None
+            username = None
+            access_hash = None
+
+            if phone_col and pd.notna(row[phone_col]):
+                phone = self._normalize_phone_cell(row[phone_col])
+
+            if user_id_col and pd.notna(row[user_id_col]):
+                raw_user_val = row[user_id_col]
+                if self._looks_like_phone_number(raw_user_val):
+                    if not phone:
+                        phone = self._normalize_phone_cell(raw_user_val)
+                else:
+                    parsed_user_id = self._parse_int_cell(raw_user_val)
+                    if parsed_user_id is not None:
+                        user_id = parsed_user_id
+
+            if username_col and pd.notna(row[username_col]):
+                username = str(row[username_col]).strip()
+                if username.startswith('@'):
+                    username = username[1:]
+                if username == '':
+                    username = None
+
+            if access_hash_col and pd.notna(row[access_hash_col]):
+                parsed_access_hash = self._parse_int_cell(row[access_hash_col])
+                access_hash = str(parsed_access_hash) if parsed_access_hash is not None else None
+
+            if not phone and not user_id and not username:
+                continue
+
+            rows.append({
+                'phone': phone,
+                'user_id': user_id,
+                'username': username,
+                'access_hash': access_hash,
+                'name': row[name_col] if name_col and pd.notna(row[name_col]) else None,
+                'company': row[company_col] if company_col and pd.notna(row[company_col]) else None,
+                'position': row[position_col] if position_col and pd.notna(row[position_col]) else None
+            })
+        return rows
+
+    def create_base(self, name: str, tenant_id: int = 1, created_by_user_id: Optional[int] = None) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO outreach_bases (tenant_id, created_by_user_id, name) VALUES (?, ?, ?)',
+                (tenant_id, created_by_user_id, name.strip())
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def get_bases(self, tenant_id: int = 1) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT b.id, b.name, b.created_at, b.created_by_user_id, COUNT(c.id)
+                FROM outreach_bases b
+                LEFT JOIN outreach_base_contacts c
+                  ON c.base_id = b.id AND c.tenant_id = b.tenant_id
+                WHERE b.tenant_id = ?
+                GROUP BY b.id
+                ORDER BY datetime(b.created_at) DESC, b.id DESC
+            ''', (tenant_id,))
+            return [{
+                'id': int(r[0]),
+                'name': r[1],
+                'created_at': r[2],
+                'created_by_user_id': r[3],
+                'contacts_count': int(r[4] or 0)
+            } for r in cursor.fetchall()]
+
+    def get_base(self, base_id: int, tenant_id: int = 1) -> Optional[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT b.id, b.name, b.created_at, b.created_by_user_id, COUNT(c.id)
+                FROM outreach_bases b
+                LEFT JOIN outreach_base_contacts c
+                  ON c.base_id = b.id AND c.tenant_id = b.tenant_id
+                WHERE b.tenant_id = ? AND b.id = ?
+                GROUP BY b.id
+            ''', (tenant_id, base_id))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'id': int(row[0]),
+                'name': row[1],
+                'created_at': row[2],
+                'created_by_user_id': row[3],
+                'contacts_count': int(row[4] or 0)
+            }
+
+    def delete_base(self, base_id: int, tenant_id: int = 1):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM outreach_base_contacts WHERE tenant_id = ? AND base_id = ?', (tenant_id, base_id))
+            cursor.execute('UPDATE outreach_campaigns SET base_id = NULL WHERE tenant_id = ? AND base_id = ?', (tenant_id, base_id))
+            cursor.execute('DELETE FROM outreach_bases WHERE tenant_id = ? AND id = ?', (tenant_id, base_id))
+            conn.commit()
+
+    def add_base_contacts(self, base_id: int, contacts: List[dict], tenant_id: int = 1, source_file: Optional[str] = None) -> dict:
+        imported = 0
+        skipped = 0
+        if not contacts:
+            return {'imported': 0, 'skipped': 0}
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            for item in contacts:
+                user_id = item.get('user_id')
+                if user_id:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_blacklist WHERE tenant_id = ? AND user_id = ?',
+                        (tenant_id, user_id)
+                    )
+                    if cursor.fetchone():
+                        skipped += 1
+                        continue
+
+                phone = item.get('phone')
+                username = item.get('username')
+                access_hash = item.get('access_hash')
+
+                exists = False
+                if phone:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_base_contacts WHERE tenant_id = ? AND base_id = ? AND phone = ? LIMIT 1',
+                        (tenant_id, base_id, phone)
+                    )
+                    exists = cursor.fetchone() is not None
+                if not exists and user_id:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_base_contacts WHERE tenant_id = ? AND base_id = ? AND user_id = ? LIMIT 1',
+                        (tenant_id, base_id, user_id)
+                    )
+                    exists = cursor.fetchone() is not None
+                if not exists and username:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_base_contacts WHERE tenant_id = ? AND base_id = ? AND username = ? LIMIT 1',
+                        (tenant_id, base_id, username)
+                    )
+                    exists = cursor.fetchone() is not None
+                if exists:
+                    skipped += 1
+                    continue
+
+                cursor.execute('''
+                    INSERT INTO outreach_base_contacts
+                    (tenant_id, base_id, phone, username, access_hash, name, company, position, source_file, user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    tenant_id, base_id, phone, username, access_hash,
+                    item.get('name'), item.get('company'), item.get('position'),
+                    source_file, user_id
+                ))
+                imported += 1
+            conn.commit()
+        return {'imported': imported, 'skipped': skipped}
+
+    def import_contacts_to_base(self, base_id: int, file_path: str, tenant_id: int = 1) -> dict:
+        if file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+        contacts = self._collect_contacts_rows_from_df(df)
+        result = self.add_base_contacts(
+            base_id=base_id,
+            contacts=contacts,
+            tenant_id=tenant_id,
+            source_file=os.path.basename(file_path)
+        )
+        if result['imported'] == 0:
+            raise Exception("Импорт не выполнен: нет новых валидных контактов")
+        return result
+
+    def get_base_contacts(self, base_id: int, limit: int = 50, offset: int = 0, tenant_id: int = 1) -> dict:
+        limit = max(1, min(int(limit or 50), 1000))
+        offset = max(0, int(offset or 0))
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT COUNT(*) FROM outreach_base_contacts WHERE tenant_id = ? AND base_id = ?',
+                (tenant_id, base_id)
+            )
+            total = int(cursor.fetchone()[0] or 0)
+            cursor.execute('''
+                SELECT id, phone, username, user_id, name, company, position, access_hash
+                FROM outreach_base_contacts
+                WHERE tenant_id = ? AND base_id = ?
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+            ''', (tenant_id, base_id, limit, offset))
+            items = [{
+                'id': int(r[0]),
+                'phone': r[1],
+                'username': r[2],
+                'user_id': r[3],
+                'name': r[4],
+                'company': r[5],
+                'position': r[6],
+                'access_hash': r[7]
+            } for r in cursor.fetchall()]
+            return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
+
+    def sync_campaign_contacts_from_base(self, campaign_id: int, base_id: int, tenant_id: int = 1, reset: bool = False) -> dict:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            if reset:
+                cursor.execute('DELETE FROM conversations WHERE tenant_id = ? AND campaign_id = ?', (tenant_id, campaign_id))
+                cursor.execute('DELETE FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ?', (tenant_id, campaign_id))
+
+            cursor.execute('''
+                SELECT phone, username, access_hash, name, company, position, user_id
+                FROM outreach_base_contacts
+                WHERE tenant_id = ? AND base_id = ?
+            ''', (tenant_id, base_id))
+            base_rows = cursor.fetchall()
+
+            imported = 0
+            skipped = 0
+            for phone, username, access_hash, name, company, position, user_id in base_rows:
+                if user_id:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_blacklist WHERE tenant_id = ? AND user_id = ?',
+                        (tenant_id, user_id)
+                    )
+                    if cursor.fetchone():
+                        skipped += 1
+                        continue
+
+                exists = False
+                if phone:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ? AND phone = ? LIMIT 1',
+                        (tenant_id, campaign_id, phone)
+                    )
+                    exists = cursor.fetchone() is not None
+                if not exists and user_id:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ? AND user_id = ? LIMIT 1',
+                        (tenant_id, campaign_id, user_id)
+                    )
+                    exists = cursor.fetchone() is not None
+                if not exists and username:
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ? AND username = ? LIMIT 1',
+                        (tenant_id, campaign_id, username)
+                    )
+                    exists = cursor.fetchone() is not None
+                if exists:
+                    skipped += 1
+                    continue
+
+                cursor.execute('''
+                    INSERT INTO outreach_contacts
+                    (tenant_id, campaign_id, phone, username, access_hash, name, company, position, source_file, status, user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+                ''', (
+                    tenant_id, campaign_id, phone, username, access_hash,
+                    name, company, position, f'base:{base_id}', user_id
+                ))
+                imported += 1
+
+            cursor.execute(
+                'SELECT COUNT(*) FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ?',
+                (tenant_id, campaign_id)
+            )
+            total = int(cursor.fetchone()[0] or 0)
+            cursor.execute(
+                'UPDATE outreach_campaigns SET total_contacts = ? WHERE tenant_id = ? AND id = ?',
+                (total, tenant_id, campaign_id)
+            )
+            conn.commit()
+            return {'imported': imported, 'skipped': skipped, 'total': total}
     
     def import_contacts(self, campaign_id: int, file_path: str, tenant_id: int = 1) -> dict:
         """Импорт контактов из CSV/Excel"""
