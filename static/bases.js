@@ -5,6 +5,7 @@ const BASE_CONTACTS_PAGE_SIZE = 100;
 
 document.addEventListener('DOMContentLoaded', async () => {
     setupHandlers();
+    setupDorksControls();
     await Promise.all([loadBases(), loadBlacklist()]);
 });
 
@@ -15,6 +16,7 @@ function setupHandlers() {
         if (e.key === 'Enter') addBlacklistFromInput();
     });
     document.getElementById('parseChatBtn')?.addEventListener('click', parseChatToBase);
+    document.getElementById('runDorksBtn')?.addEventListener('click', runDorksCollection);
 
     const uploadArea = document.getElementById('baseUploadArea');
     const fileInput = document.getElementById('baseFileInput');
@@ -36,6 +38,16 @@ function setupHandlers() {
             if (file) uploadBaseFile(file);
             fileInput.value = '';
         });
+    }
+}
+
+function setupDorksControls() {
+    const btn = document.getElementById('runDorksBtn');
+    const status = document.getElementById('dorksStatus');
+    if (!btn || !status) return;
+    if (!IS_ADMIN) {
+        btn.disabled = true;
+        status.textContent = 'Для пользователей запуск dorks-поиска пока отключен.';
     }
 }
 
@@ -249,6 +261,54 @@ async function parseChatToBase() {
     status.textContent = `Готово: imported ${data.imported || 0}, skipped ${data.skipped || 0} · режим ${data.mode || mode}`;
     document.getElementById('parseChatInput').value = '';
     document.getElementById('parseBaseNameInput').value = '';
+    await loadBases();
+}
+
+async function runDorksCollection() {
+    const status = document.getElementById('dorksStatus');
+    if (!status) return;
+    if (!IS_ADMIN) {
+        status.textContent = 'Доступно только для admin.';
+        return;
+    }
+    const position = (document.getElementById('dorkPositionInput')?.value || '').trim();
+    const language = (document.getElementById('dorkLanguageInput')?.value || 'RU').trim();
+    const baseName = (document.getElementById('dorkBaseNameInput')?.value || '').trim();
+    const resultsLimitRaw = Number(document.getElementById('dorkResultsLimitInput')?.value || 300);
+    const resultsLimit = Number.isFinite(resultsLimitRaw) ? Math.max(50, Math.min(2000, Math.floor(resultsLimitRaw))) : 300;
+    const sources = Array.from(document.querySelectorAll('.dork-source:checked'))
+        .map(el => String(el.value || '').trim())
+        .filter(Boolean);
+
+    if (!position) {
+        status.textContent = 'Укажите должность.';
+        return;
+    }
+    if (!sources.length) {
+        status.textContent = 'Выберите хотя бы один источник.';
+        return;
+    }
+
+    status.textContent = 'Идёт поиск по доркам...';
+    const response = await fetch('/api/bases/dorks/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            position,
+            language,
+            sources,
+            base_name: baseName || `Dorks ${position}`,
+            results_limit: resultsLimit
+        })
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        status.textContent = data.error || 'Ошибка dorks-поиска.';
+        return;
+    }
+    status.textContent = `Готово: imported ${data.imported || 0}, skipped ${data.skipped || 0}, dedup ${data.dedup_total || 0}`;
+    document.getElementById('dorkPositionInput').value = '';
+    document.getElementById('dorkBaseNameInput').value = '';
     await loadBases();
 }
 

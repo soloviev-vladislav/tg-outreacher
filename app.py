@@ -7,10 +7,12 @@ import json
 import sqlite3
 import io
 import subprocess
+import re
 from datetime import datetime, date
 from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash, generate_password_hash
 import pandas as pd
+import requests
 from telethon import TelegramClient, errors
 from telegram_bot import TelegramAccountManager, Database, OutreachManager
 import logging
@@ -2784,6 +2786,86 @@ def _parse_chat_members_with_service(tenant_id: int, chat_ref: str, mode: str = 
         raise RuntimeError('Некорректный формат данных парсера')
     return data
 
+
+def _build_dork_queries(position: str, language: str, sources: list[str]) -> list[tuple[str, str]]:
+    role = position.strip()
+    lang = (language or 'RU').strip().upper()
+    selected_sources = [str(s or '').strip().lower() for s in (sources or [])]
+    out: list[tuple[str, str]] = []
+
+    telegram_templates = [
+        '"Send message" {role} site:t.me',
+        '"Send message" "{role}" site:t.me',
+        '"Send message" "{role} в" site:t.me',
+        '"Send message" "{role} in" site:t.me',
+        '"Send message" "{role} at" site:t.me',
+        '"Отправить сообщение" "{role}" site:t.me'
+    ]
+    linkedin_templates = [
+        '"{role}" "telegram: @" site:linkedin.com',
+        '"{role}" "t.me/" site:linkedin.com',
+        '"{role}" "Telegram" site:linkedin.com',
+        '"{role} in" "telegram" site:linkedin.com',
+        '"{role} at" "telegram" site:linkedin.com'
+    ]
+    tenchat_templates = [
+        '"{role}" "telegram" site:tenchat.ru',
+        '"{role}" "t.me/" site:tenchat.ru',
+        '"{role}" "telegram: @" site:tenchat.ru',
+        '"{role} в" "telegram" site:tenchat.ru',
+        '"{role} in" "telegram" site:tenchat.ru',
+        '"{role} at" "telegram" site:tenchat.ru'
+    ]
+
+    per_source = {
+        'telegram': telegram_templates,
+        'linkedin': linkedin_templates,
+        'tenchat': tenchat_templates
+    }
+
+    # Сохраняем "полный" пул комбинаций, но чуть поджимаем по языку.
+    def _allow(q: str) -> bool:
+        if lang == 'RU':
+            return (' в"' in q) or ('Отправить сообщение' in q) or ('Send message' in q)
+        if lang == 'ENG':
+            return (' in"' in q) or (' at"' in q) or ('Send message' in q) or ('telegram' in q.lower())
+        return True
+
+    for source in selected_sources:
+        for tpl in per_source.get(source, []):
+            q = tpl.format(role=role)
+            if _allow(q):
+                out.append((source, q))
+
+    # Дедуп по query
+    seen = set()
+    uniq = []
+    for source, q in out:
+        key = q.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((source, q))
+    return uniq
+
+
+_TG_USERNAME_RE = re.compile(r'(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{4,31})(?![A-Za-z0-9_])')
+_TG_URL_RE = re.compile(r'(?:https?://)?(?:t(?:elegram)?\.me)/([A-Za-z][A-Za-z0-9_]{4,31})', re.IGNORECASE)
+
+
+def _extract_usernames_from_result(link: str, title: str, snippet: str) -> list[str]:
+    text = ' '.join([link or '', title or '', snippet or ''])
+    candidates = set()
+    for m in _TG_URL_RE.findall(text):
+        u = (m or '').strip()
+        if u and u.lower() not in {'joinchat', 'share', 's', 'c'}:
+            candidates.add(u)
+    for m in _TG_USERNAME_RE.findall(text):
+        u = (m or '').strip()
+        if u:
+            candidates.add(u)
+    return sorted(candidates)
+
 @app.route('/api/bases/parse-chat', methods=['POST'])
 def parse_chat_to_base():
     tenant_id = get_current_tenant_id()
@@ -2815,6 +2897,132 @@ def parse_chat_to_base():
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/bases/dorks/search', methods=['POST'])
+def collect_base_by_dorks():
+    user = get_current_user() or {}
+    if not is_admin_user(user):
+        return jsonify({'error': 'Функция временно доступна только admin'}), 403
+
+    tenant_id = get_current_tenant_id()
+    data = request.get_json(silent=True) or {}
+    position = str(data.get('position') or '').strip()
+    language = str(data.get('language') or 'RU').strip().upper()
+    sources = data.get('sources') or []
+    base_name = str(data.get('base_name') or '').strip()
+    try:
+        results_limit = int(data.get('results_limit') or 300)
+    except Exception:
+        return jsonify({'error': 'results_limit must be integer'}), 400
+
+    if not position:
+        return jsonify({'error': 'position is required'}), 400
+    if language not in ('RU', 'ENG'):
+        return jsonify({'error': 'language must be RU or ENG'}), 400
+    if not isinstance(sources, list) or not sources:
+        return jsonify({'error': 'sources must be non-empty list'}), 400
+    if not base_name:
+        base_name = f'Dorks: {position}'
+    results_limit = max(50, min(2000, results_limit))
+
+    serper_api_key = os.getenv('SERPER_API_KEY', '').strip()
+    if not serper_api_key:
+        return jsonify({'error': 'SERPER_API_KEY is not configured on server'}), 400
+
+    queries = _build_dork_queries(position=position, language=language, sources=sources)
+    if not queries:
+        return jsonify({'error': 'Нет валидных комбинаций запросов'}), 400
+
+    per_query_num = 20
+    found_candidates = []
+    requests_ok = 0
+    requests_failed = 0
+
+    headers = {
+        'X-API-KEY': serper_api_key,
+        'Content-Type': 'application/json'
+    }
+    for source, query in queries:
+        try:
+            response = requests.post(
+                'https://google.serper.dev/search',
+                headers=headers,
+                json={'q': query, 'num': per_query_num},
+                timeout=25
+            )
+            if response.status_code != 200:
+                requests_failed += 1
+                continue
+            payload = response.json() if response.content else {}
+            organic = payload.get('organic') or []
+            requests_ok += 1
+            for item in organic:
+                link = str(item.get('link') or '').strip()
+                title = str(item.get('title') or '').strip()
+                snippet = str(item.get('snippet') or '').strip()
+                usernames = _extract_usernames_from_result(link=link, title=title, snippet=snippet)
+                for u in usernames:
+                    found_candidates.append({
+                        'username': u,
+                        'name': None,
+                        'position': position,
+                        'company': source,
+                        'source_url': link,
+                        'matched_query': query
+                    })
+        except Exception:
+            requests_failed += 1
+
+    # Дедуп по username.
+    unique_by_username = {}
+    for item in found_candidates:
+        uname = (item.get('username') or '').strip().lstrip('@')
+        if not uname:
+            continue
+        key = uname.lower()
+        if key not in unique_by_username:
+            unique_by_username[key] = item
+    deduped = list(unique_by_username.values())[:results_limit]
+
+    if not deduped:
+        return jsonify({
+            'error': 'По запросам ничего не найдено',
+            'queries_total': len(queries),
+            'requests_ok': requests_ok,
+            'requests_failed': requests_failed
+        }), 400
+
+    base_id = outreach.create_base(
+        name=base_name,
+        tenant_id=tenant_id,
+        created_by_user_id=int(user.get('id') or 0)
+    )
+    contacts = [{
+        'phone': None,
+        'username': d['username'],
+        'access_hash': None,
+        'name': d.get('name'),
+        'company': d.get('company'),
+        'position': d.get('position'),
+        'user_id': None
+    } for d in deduped]
+    result = outreach.add_base_contacts(
+        base_id=base_id,
+        contacts=contacts,
+        tenant_id=tenant_id,
+        source_file=f'dorks:{position}'
+    )
+    return jsonify({
+        'base_id': base_id,
+        'queries_total': len(queries),
+        'requests_ok': requests_ok,
+        'requests_failed': requests_failed,
+        'found_total': len(found_candidates),
+        'dedup_total': len(deduped),
+        'imported': result.get('imported', 0),
+        'skipped': result.get('skipped', 0)
+    })
 
 @app.route('/api/outreach/campaigns', methods=['GET'])
 def get_outreach_campaigns():

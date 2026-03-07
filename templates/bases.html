@@ -78,6 +78,49 @@
         </div>
 
         <div class="card" style="margin-bottom: 18px;">
+            <h2 class="section-title">Сбор базы по Google Dorks</h2>
+            <div class="muted-text" style="margin-bottom: 10px; font-size: 12px;">
+                Поиск профилей по должности через Serper (Google API): Telegram, LinkedIn, TenChat.
+            </div>
+            <div class="form-row-3">
+                <div class="form-group">
+                    <label>Должность</label>
+                    <input id="dorkPositionInput" type="text" class="form-control" placeholder="Например: HRD">
+                </div>
+                <div class="form-group">
+                    <label>Язык</label>
+                    <select id="dorkLanguageInput" class="form-control">
+                        <option value="RU" selected>RU</option>
+                        <option value="ENG">ENG</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Лимит результатов</label>
+                    <input id="dorkResultsLimitInput" type="number" class="form-control" min="50" max="2000" value="300">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Источники</label>
+                <div style="display:flex; gap: 14px; flex-wrap: wrap;">
+                    <label><input type="checkbox" class="dork-source" value="telegram" checked> Telegram</label>
+                    <label><input type="checkbox" class="dork-source" value="linkedin" checked> LinkedIn</label>
+                    <label><input type="checkbox" class="dork-source" value="tenchat" checked> TenChat</label>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Название новой базы</label>
+                <input id="dorkBaseNameInput" type="text" class="form-control" placeholder="Например: Dorks HRD RU">
+            </div>
+            <div class="btn-group">
+                <button id="runDorksBtn" class="btn btn-primary">Собрать базу</button>
+            </div>
+            <div id="dorksStatus" class="muted-text" style="margin-top: 10px;"></div>
+            <div class="muted-text" style="margin-top: 8px; font-size: 12px;">
+                Функция показана всем, но запуск сейчас доступен только admin.
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom: 18px;">
             <div class="panel-head">
                 <h2 class="section-title" style="margin:0;">Черный список user_id</h2>
                 <div class="btn-group">
@@ -99,6 +142,9 @@
         </div>
     </div>
 
+    <script>
+        const IS_ADMIN = {{ 'true' if current_user and current_user.role == 'admin' else 'false' }};
+    </script>
     <script src="/static/bases.js"></script>
 </body>
 </html>
