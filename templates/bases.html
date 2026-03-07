@@ -43,15 +43,32 @@
             <div class="card">
                 <h2 class="section-title">Парсинг участников чата</h2>
                 <div class="muted-text" style="margin-bottom: 10px; font-size: 12px;">
-                    Укажите ссылку/username чата с открытыми участниками. В базу попадут только участники с <code>username</code>.
+                    Укажите ссылку/username открытого чата. Можно парсить либо список участников, либо авторов сообщений (если участники скрыты).
                 </div>
                 <div class="form-group">
                     <label>Ссылка на чат</label>
                     <input id="parseChatInput" type="text" class="form-control" placeholder="https://t.me/username или @username">
                 </div>
+                <div class="form-row-3">
+                    <div class="form-group">
+                        <label>Режим</label>
+                        <select id="parseModeInput" class="form-control">
+                            <option value="auto" selected>Авто</option>
+                            <option value="participants">Участники (если открыты)</option>
+                            <option value="authors">Авторы сообщений (если участники скрыты)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Глубина сообщений</label>
+                        <input id="parseMessagesLimitInput" type="number" class="form-control" min="100" max="10000" value="3000">
+                    </div>
+                </div>
                 <div class="form-group">
                     <label>Название новой базы</label>
                     <input id="parseBaseNameInput" type="text" class="form-control" placeholder="Например: Парсинг aihubco">
+                </div>
+                <div class="muted-text" style="margin-bottom: 8px; font-size: 12px;">
+                    Важно: если у контакта нет <code>username</code>, отправка по <code>user_id</code> возможна только когда аккаунт-отправитель состоит в чате-источнике, чтобы получить <code>access_hash</code>.
                 </div>
                 <div class="btn-group">
                     <button id="parseChatBtn" class="btn btn-primary">Запустить парсинг</button>

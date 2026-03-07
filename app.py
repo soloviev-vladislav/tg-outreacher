@@ -2706,7 +2706,7 @@ def _get_service_session_for_parsing(tenant_id: int):
     session_name = row[1] or row[0]
     return int(api_id), api_hash, session_name
 
-def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
+def _parse_chat_members_with_service(tenant_id: int, chat_ref: str, mode: str = 'auto', messages_limit: int = 3000):
     api_id, api_hash, session_name = _get_service_session_for_parsing(tenant_id)
     script_path = os.path.abspath(os.path.join('tools', 'parse_chat_members.py'))
     if not os.path.exists(script_path):
@@ -2719,7 +2719,9 @@ def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
         '--session', session_path,
         '--api-id', str(api_id),
         '--api-hash', api_hash,
-        '--chat', chat_ref
+        '--chat', chat_ref,
+        '--mode', str(mode or 'auto'),
+        '--messages-limit', str(int(messages_limit or 3000))
     ]
     proc = subprocess.run(
         cmd,
@@ -2745,17 +2747,27 @@ def parse_chat_to_base():
     data = request.get_json(silent=True) or {}
     chat_ref = str(data.get('chat') or '').strip()
     base_name = str(data.get('base_name') or '').strip()
+    mode = str(data.get('mode') or 'auto').strip().lower()
+    try:
+        messages_limit = int(data.get('messages_limit') or 3000)
+    except Exception:
+        return jsonify({'error': 'messages_limit must be integer'}), 400
+    if mode not in ('auto', 'participants', 'authors'):
+        return jsonify({'error': 'mode must be auto|participants|authors'}), 400
+    messages_limit = max(100, min(10000, messages_limit))
     if not chat_ref:
         return jsonify({'error': 'chat is required'}), 400
     if not base_name:
         return jsonify({'error': 'base_name is required'}), 400
     try:
-        contacts = _parse_chat_members_with_service(tenant_id, chat_ref)
+        contacts = _parse_chat_members_with_service(tenant_id, chat_ref, mode=mode, messages_limit=messages_limit)
         if not contacts:
-            return jsonify({'error': 'В чате не найдены участники с username'}), 400
+            return jsonify({'error': 'Не удалось собрать контакты из чата'}), 400
         base_id = outreach.create_base(name=base_name, tenant_id=tenant_id, created_by_user_id=int(user.get('id') or 0))
         result = outreach.add_base_contacts(base_id=base_id, contacts=contacts, tenant_id=tenant_id, source_file=f'chat:{chat_ref}')
         result['base_id'] = base_id
+        result['mode'] = mode
+        result['messages_limit'] = messages_limit
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 400

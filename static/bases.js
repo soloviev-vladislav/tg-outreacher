@@ -215,6 +215,9 @@ async function parseChatToBase() {
     const status = document.getElementById('parseChatStatus');
     const chat = (document.getElementById('parseChatInput')?.value || '').trim();
     const baseName = (document.getElementById('parseBaseNameInput')?.value || '').trim();
+    const mode = (document.getElementById('parseModeInput')?.value || 'auto').trim();
+    const messagesLimitRaw = Number(document.getElementById('parseMessagesLimitInput')?.value || 3000);
+    const messagesLimit = Number.isFinite(messagesLimitRaw) ? Math.max(100, Math.min(10000, Math.floor(messagesLimitRaw))) : 3000;
     if (!chat) {
         status.textContent = 'Укажите ссылку/username чата';
         return;
@@ -227,14 +230,14 @@ async function parseChatToBase() {
     const response = await fetch('/api/bases/parse-chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat, base_name: baseName })
+        body: JSON.stringify({ chat, base_name: baseName, mode, messages_limit: messagesLimit })
     });
     const data = await response.json();
     if (!response.ok || data.error) {
         status.textContent = data.error || 'Ошибка парсинга';
         return;
     }
-    status.textContent = `Готово: imported ${data.imported || 0}, skipped ${data.skipped || 0}`;
+    status.textContent = `Готово: imported ${data.imported || 0}, skipped ${data.skipped || 0} · режим ${data.mode || mode}`;
     document.getElementById('parseChatInput').value = '';
     document.getElementById('parseBaseNameInput').value = '';
     await loadBases();
