@@ -6,7 +6,7 @@ const BASE_CONTACTS_PAGE_SIZE = 100;
 document.addEventListener('DOMContentLoaded', async () => {
     setupHandlers();
     setupDorksControls();
-    await Promise.all([loadBases(), loadBlacklist(), loadDorksRuns()]);
+    await Promise.all([loadBases(), loadBlacklist()]);
 });
 
 function setupHandlers() {
@@ -17,7 +17,6 @@ function setupHandlers() {
     });
     document.getElementById('parseChatBtn')?.addEventListener('click', parseChatToBase);
     document.getElementById('runDorksBtn')?.addEventListener('click', runDorksCollection);
-    document.getElementById('reloadDorksRunsBtn')?.addEventListener('click', loadDorksRuns);
 
     const uploadArea = document.getElementById('baseUploadArea');
     const fileInput = document.getElementById('baseFileInput');
@@ -310,7 +309,7 @@ async function runDorksCollection() {
     status.textContent = `Готово: imported ${data.imported || 0}, skipped ${data.skipped || 0}, dedup ${data.dedup_total || 0}`;
     document.getElementById('dorkPositionInput').value = '';
     document.getElementById('dorkBaseNameInput').value = '';
-    await Promise.all([loadBases(), loadDorksRuns()]);
+    await loadBases();
 }
 
 async function loadDorksRuns() {
