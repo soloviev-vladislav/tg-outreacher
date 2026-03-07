@@ -2705,9 +2705,11 @@ async def _parse_chat_members_with_service(tenant_id: int, chat_ref: str):
 
     session_name = row[1] or row[0]
     session_path = os.path.join('sessions', session_name)
-    client = TelegramClient(session_path, int(api_id), api_hash)
-    await client.start()
+    client = TelegramClient(session_path, int(api_id), api_hash, loop=asyncio.get_running_loop())
+    await client.connect()
     try:
+        if not await client.is_user_authorized():
+            raise RuntimeError(f'Service-сессия {session_name} не авторизована в Telegram')
         entity = await client.get_entity(chat_ref)
         participants = await client.get_participants(entity, aggressive=False)
         contacts = []
@@ -2740,7 +2742,7 @@ def parse_chat_to_base():
     if not base_name:
         return jsonify({'error': 'base_name is required'}), 400
     try:
-        contacts = run_async(_parse_chat_members_with_service(tenant_id, chat_ref))
+        contacts = run_async_threadsafe(_parse_chat_members_with_service(tenant_id, chat_ref))
         if not contacts:
             return jsonify({'error': 'В чате не найдены участники с username'}), 400
         base_id = outreach.create_base(name=base_name, tenant_id=tenant_id, created_by_user_id=int(user.get('id') or 0))
