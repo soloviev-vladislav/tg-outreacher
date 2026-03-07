@@ -15,6 +15,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import random
+from werkzeug.security import generate_password_hash
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -73,11 +74,34 @@ class Database:
         """Инициализация базы данных"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+
+            # Тенанты и пользователи (multi-user)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    is_default BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER NOT NULL,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT DEFAULT 'admin',
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(tenant_id) REFERENCES tenants(id)
+                )
+            ''')
             
             # Таблица для истории проверок
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS check_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     phone TEXT NOT NULL,
                     registered BOOLEAN NOT NULL,
                     user_id INTEGER,
@@ -97,10 +121,20 @@ class Database:
                     value TEXT
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tenant_config (
+                    tenant_id INTEGER NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT,
+                    PRIMARY KEY (tenant_id, key),
+                    FOREIGN KEY(tenant_id) REFERENCES tenants(id)
+                )
+            ''')
             
             # Таблица для статистики аккаунтов - ПОЛНАЯ ВЕРСИЯ СО ВСЕМИ КОЛОНКАМИ
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS account_stats (
+                    tenant_id INTEGER DEFAULT 1,
                     phone TEXT PRIMARY KEY,
                     session_name TEXT,
                     total_checks INTEGER DEFAULT 0,
@@ -123,6 +157,7 @@ class Database:
                     last_check_date TEXT,
                     checked_today INTEGER DEFAULT 0,
                     outreach_daily_limit INTEGER DEFAULT 20,
+                    added_by_user_id INTEGER,
                     UNIQUE(phone)
                 )
             ''')
@@ -131,6 +166,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS form_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     api_id TEXT,
                     api_hash TEXT,
                     target_chat TEXT,
@@ -144,6 +180,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS proxies (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     ip TEXT NOT NULL,
                     port INTEGER NOT NULL,
                     protocol TEXT DEFAULT 'socks5',
@@ -160,6 +197,7 @@ class Database:
             # Таблица цифровых отпечатков
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS account_fingerprints (
+                    tenant_id INTEGER DEFAULT 1,
                     account_phone TEXT PRIMARY KEY REFERENCES account_stats(phone),
                     device_model TEXT DEFAULT 'Desktop',
                     app_version TEXT DEFAULT '4.16.30',
@@ -174,6 +212,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     campaign_id INTEGER NOT NULL,
                     contact_id INTEGER NOT NULL,
                     message_id INTEGER,
@@ -191,6 +230,7 @@ class Database:
             # Локи кампаний для защиты от параллельной обработки несколькими процессами.
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS scheduler_campaign_locks (
+                    tenant_id INTEGER DEFAULT 1,
                     campaign_id INTEGER PRIMARY KEY,
                     owner TEXT NOT NULL,
                     locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -203,6 +243,8 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS outreach_campaigns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
+                    created_by_user_id INTEGER,
                     name TEXT NOT NULL,
                     message_template TEXT NOT NULL,
                     accounts TEXT DEFAULT '[]',
@@ -229,6 +271,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS outreach_contacts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     campaign_id INTEGER,
                     phone TEXT,
                     username TEXT,
@@ -253,6 +296,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS outreach_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     contact_id INTEGER,
                     account_used TEXT,
                     message_text TEXT,
@@ -266,6 +310,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS outreach_templates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id INTEGER DEFAULT 1,
                     name TEXT NOT NULL,
                     template_text TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -276,38 +321,107 @@ class Database:
             # Глобальный черный список user_id для всех кампаний.
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS outreach_blacklist (
+                    tenant_id INTEGER DEFAULT 1,
                     user_id INTEGER PRIMARY KEY,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
 
+            # Миграция старых БД: добавляем недостающие колонки до создания индексов.
+            schema_additions = {
+                'check_history': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'account_stats': {'tenant_id': 'INTEGER DEFAULT 1', 'added_by_user_id': 'INTEGER'},
+                'form_data': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'proxies': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'account_fingerprints': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'conversations': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'scheduler_campaign_locks': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'outreach_campaigns': {'tenant_id': 'INTEGER DEFAULT 1', 'created_by_user_id': 'INTEGER'},
+                'outreach_contacts': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'outreach_templates': {'tenant_id': 'INTEGER DEFAULT 1'},
+                'outreach_blacklist': {'tenant_id': 'INTEGER DEFAULT 1'}
+            }
+            for table_name, cols in schema_additions.items():
+                try:
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    existing_cols = {row[1] for row in cursor.fetchall()}
+                    for col_name, col_def in cols.items():
+                        if col_name not in existing_cols:
+                            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}")
+                except Exception as e:
+                    logger.warning(f"Schema migration skipped for {table_name}: {e}")
+
             # Индексы для производительности рассылок и проверки ответов.
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_contacts_campaign_status ON outreach_contacts(campaign_id, status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_contact_direction_sent_at ON conversations(contact_id, direction, sent_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_campaign_direction_sent_at ON conversations(campaign_id, direction, sent_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_campaigns_tenant ON outreach_campaigns(tenant_id, status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_contacts_tenant ON outreach_contacts(tenant_id, campaign_id, status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id, campaign_id, contact_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_stats_tenant ON account_stats(tenant_id, phone)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_proxies_tenant ON proxies(tenant_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_check_history_tenant ON check_history(tenant_id, check_date)')
 
+            # Гарантируем default tenant
+            cursor.execute("SELECT id FROM tenants WHERE is_default = 1 LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                default_tenant_id = int(row[0])
+            else:
+                cursor.execute("INSERT INTO tenants (name, is_default) VALUES ('default', 1)")
+                default_tenant_id = int(cursor.lastrowid)
+
+            # Дозаполняем tenant_id для существующих строк
+            for table in (
+                'check_history', 'account_stats', 'form_data', 'proxies',
+                'account_fingerprints', 'conversations', 'scheduler_campaign_locks',
+                'outreach_campaigns', 'outreach_contacts', 'outreach_messages',
+                'outreach_templates', 'outreach_blacklist'
+            ):
+                try:
+                    cursor.execute(f'UPDATE {table} SET tenant_id = ? WHERE tenant_id IS NULL', (default_tenant_id,))
+                except Exception:
+                    pass
+
+            # Дефолтный админ, если пользователей ещё нет.
+            cursor.execute('SELECT COUNT(*) FROM users')
+            users_count = int(cursor.fetchone()[0] or 0)
+            if users_count == 0:
+                admin_username = str(os.getenv('DEFAULT_ADMIN_USERNAME', 'admin')).strip() or 'admin'
+                admin_password = str(os.getenv('DEFAULT_ADMIN_PASSWORD', os.getenv('APP_PASSWORD', 'admin'))).strip() or 'admin'
+                cursor.execute('''
+                    INSERT INTO users (tenant_id, username, password_hash, role, is_active)
+                    VALUES (?, ?, ?, 'admin', 1)
+                ''', (default_tenant_id, admin_username, generate_password_hash(admin_password)))
+                logger.warning("Created default admin user for multi-user mode: username='%s'", admin_username)
+
+            cursor.execute("UPDATE users SET role = 'admin' WHERE role = 'owner'")
+            cursor.execute("UPDATE users SET role = 'user' WHERE role = 'viewer'")
+            
             conn.commit()
             logger.info("База данных успешно инициализирована")
     
-    def save_form_data(self, api_id: str, api_hash: str, target_chat: str, phones_text: str, delay: int = 2):
+    def save_form_data(self, api_id: str, api_hash: str, target_chat: str, phones_text: str, delay: int = 2, tenant_id: int = 1):
         """Сохранение данных формы"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM form_data')
+            cursor.execute('DELETE FROM form_data WHERE tenant_id = ?', (tenant_id,))
             cursor.execute('''
-                INSERT INTO form_data (api_id, api_hash, target_chat, phones_text, delay)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (api_id, api_hash, target_chat, phones_text, delay))
+                INSERT INTO form_data (tenant_id, api_id, api_hash, target_chat, phones_text, delay)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (tenant_id, api_id, api_hash, target_chat, phones_text, delay))
             conn.commit()
     
-    def load_form_data(self) -> dict:
+    def load_form_data(self, tenant_id: int = 1) -> dict:
         """Загрузка сохраненных данных формы"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT api_id, api_hash, target_chat, phones_text, delay 
-                FROM form_data ORDER BY saved_at DESC LIMIT 1
-            ''')
+                FROM form_data
+                WHERE tenant_id = ?
+                ORDER BY saved_at DESC LIMIT 1
+            ''', (tenant_id,))
             result = cursor.fetchone()
             if result:
                 return {
@@ -326,15 +440,16 @@ class Database:
             }
     
     def save_check(self, phone: str, registered: bool, user_data: dict = None, 
-                   account_used: str = None, is_test: bool = False):
+                   account_used: str = None, is_test: bool = False, tenant_id: int = 1):
         """Сохранение результата проверки"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO check_history 
-                (phone, registered, user_id, username, first_name, last_name, account_used, is_test)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (tenant_id, phone, registered, user_id, username, first_name, last_name, account_used, is_test)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
+                tenant_id,
                 phone, 
                 registered,
                 user_data.get('user_id') if user_data else None,
@@ -368,18 +483,33 @@ class Database:
             
             conn.commit()
     
-    def get_config(self, key: str, default=None):
+    def get_config(self, key: str, default=None, tenant_id: Optional[int] = None):
         """Получение значения из конфига"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            if tenant_id is not None:
+                cursor.execute(
+                    'SELECT value FROM tenant_config WHERE tenant_id = ? AND key = ?',
+                    (tenant_id, key)
+                )
+                result = cursor.fetchone()
+                if result:
+                    return result[0]
             cursor.execute('SELECT value FROM config WHERE key = ?', (key,))
             result = cursor.fetchone()
             return result[0] if result else default
     
-    def set_config(self, key: str, value: str):
+    def set_config(self, key: str, value: str, tenant_id: Optional[int] = None):
         """Сохранение значения в конфиг"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            if tenant_id is not None:
+                cursor.execute('''
+                    INSERT INTO tenant_config (tenant_id, key, value) VALUES (?, ?, ?)
+                    ON CONFLICT(tenant_id, key) DO UPDATE SET value = ?
+                ''', (tenant_id, key, value, value))
+                conn.commit()
+                return
             cursor.execute('''
                 INSERT INTO config (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = ?
@@ -577,13 +707,20 @@ class Database:
             cursor.execute('SELECT COUNT(*) FROM check_history')
             return cursor.fetchone()[0]
     
-    def get_history(self, limit: int = 100) -> List[dict]:
+    def get_history(self, limit: int = 100, tenant_id: Optional[int] = None) -> List[dict]:
         """Получение истории проверок"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM check_history ORDER BY check_date DESC LIMIT ?
-            ''', (limit,))
+            if tenant_id is not None:
+                cursor.execute('''
+                    SELECT * FROM check_history
+                    WHERE tenant_id = ?
+                    ORDER BY check_date DESC LIMIT ?
+                ''', (tenant_id, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM check_history ORDER BY check_date DESC LIMIT ?
+                ''', (limit,))
             results = cursor.fetchall()
             
             history = []
@@ -611,7 +748,8 @@ class OutreachManager:
     
     def create_campaign(self, name: str, message_template: str, accounts: List[str], 
                        daily_limit: int = 10, delay_min: int = 5, delay_max: int = 15,
-                       strategy: Optional[dict] = None, schedule: Optional[dict] = None):
+                       strategy: Optional[dict] = None, schedule: Optional[dict] = None,
+                       tenant_id: int = 1, created_by_user_id: Optional[int] = None):
         """Создание новой кампании"""
         strategy_json = json.dumps(strategy or {"steps": []})
         schedule_json = json.dumps(schedule) if schedule else None
@@ -619,15 +757,16 @@ class OutreachManager:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO outreach_campaigns 
-                (name, message_template, accounts, daily_limit, delay_min, delay_max, strategy, schedule)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (name, message_template, json.dumps(accounts), daily_limit, delay_min, delay_max, strategy_json, schedule_json))
+                (tenant_id, created_by_user_id, name, message_template, accounts, daily_limit, delay_min, delay_max, strategy, schedule)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (tenant_id, created_by_user_id, name, message_template, json.dumps(accounts), daily_limit, delay_min, delay_max, strategy_json, schedule_json))
             conn.commit()
             return cursor.lastrowid
 
     def update_campaign(self, campaign_id: int, name: str, message_template: str, accounts: List[str],
                         daily_limit: int, delay_min: int, delay_max: int,
-                        strategy: Optional[dict] = None, schedule: Optional[dict] = None):
+                        strategy: Optional[dict] = None, schedule: Optional[dict] = None,
+                        tenant_id: int = 1):
         """Обновление основных настроек кампании"""
         strategy_json = json.dumps(strategy or {"steps": []})
         schedule_json = json.dumps(schedule) if schedule else None
@@ -637,7 +776,7 @@ class OutreachManager:
                 UPDATE outreach_campaigns
                 SET name = ?, message_template = ?, accounts = ?, daily_limit = ?,
                     delay_min = ?, delay_max = ?, strategy = ?, schedule = ?
-                WHERE id = ?
+                WHERE id = ? AND tenant_id = ?
             ''', (
                 name,
                 message_template,
@@ -647,11 +786,12 @@ class OutreachManager:
                 delay_max,
                 strategy_json,
                 schedule_json,
-                campaign_id
+                campaign_id,
+                tenant_id
             ))
             conn.commit()
     
-    def get_campaigns(self) -> List[dict]:
+    def get_campaigns(self, tenant_id: int = 1) -> List[dict]:
         """Получение списка всех кампаний"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -663,8 +803,9 @@ class OutreachManager:
                            total_contacts, sent_count, reply_count, meeting_count,
                            strategy, ai_enabled, ai_tone, schedule
                     FROM outreach_campaigns
+                    WHERE tenant_id = ?
                     ORDER BY created_at DESC
-                ''')
+                ''', (tenant_id,))
             except sqlite3.OperationalError:
                 has_schedule = False
                 cursor.execute('''
@@ -673,8 +814,9 @@ class OutreachManager:
                            total_contacts, sent_count, reply_count, meeting_count,
                            strategy, ai_enabled, ai_tone
                     FROM outreach_campaigns
+                    WHERE tenant_id = ?
                     ORDER BY created_at DESC
-                ''')
+                ''', (tenant_id,))
             
             campaigns = []
             for row in cursor.fetchall():
@@ -701,7 +843,7 @@ class OutreachManager:
                 })
             return campaigns
     
-    def get_campaign(self, campaign_id: int) -> dict:
+    def get_campaign(self, campaign_id: int, tenant_id: int = 1) -> dict:
         """Получение конкретной кампании"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -712,8 +854,8 @@ class OutreachManager:
                            delay_min, delay_max, status, created_at, started_at,
                            total_contacts, sent_count, reply_count, meeting_count,
                            strategy, ai_enabled, ai_tone, schedule
-                    FROM outreach_campaigns WHERE id = ?
-                ''', (campaign_id,))
+                    FROM outreach_campaigns WHERE id = ? AND tenant_id = ?
+                ''', (campaign_id, tenant_id))
             except sqlite3.OperationalError:
                 has_schedule = False
                 cursor.execute('''
@@ -721,8 +863,8 @@ class OutreachManager:
                            delay_min, delay_max, status, created_at, started_at,
                            total_contacts, sent_count, reply_count, meeting_count,
                            strategy, ai_enabled, ai_tone
-                    FROM outreach_campaigns WHERE id = ?
-                ''', (campaign_id,))
+                    FROM outreach_campaigns WHERE id = ? AND tenant_id = ?
+                ''', (campaign_id, tenant_id))
             row = cursor.fetchone()
             if row:
                 return {
@@ -857,7 +999,7 @@ class OutreachManager:
             }
         }
     
-    def import_contacts(self, campaign_id: int, file_path: str) -> dict:
+    def import_contacts(self, campaign_id: int, file_path: str, tenant_id: int = 1) -> dict:
         """Импорт контактов из CSV/Excel"""
         imported = 0
         skipped = 0
@@ -933,7 +1075,10 @@ class OutreachManager:
                     continue
 
                 if user_id:
-                    cursor.execute('SELECT 1 FROM outreach_blacklist WHERE user_id = ?', (user_id,))
+                    cursor.execute(
+                        'SELECT 1 FROM outreach_blacklist WHERE tenant_id = ? AND user_id = ?',
+                        (tenant_id, user_id)
+                    )
                     if cursor.fetchone():
                         skipped += 1
                         logger.info(f"Контакт user_id {user_id} в blacklist, пропускаем")
@@ -948,8 +1093,8 @@ class OutreachManager:
                 if phone:
                     cursor.execute('''
                         SELECT id, status FROM outreach_contacts 
-                        WHERE campaign_id = ? AND phone = ?
-                    ''', (campaign_id, phone))
+                        WHERE campaign_id = ? AND tenant_id = ? AND phone = ?
+                    ''', (campaign_id, tenant_id, phone))
                     existing = cursor.fetchone()
                     if existing:
                         if existing[1] == 'failed':
@@ -968,8 +1113,8 @@ class OutreachManager:
                 if user_id:
                     cursor.execute('''
                         SELECT id, status FROM outreach_contacts 
-                        WHERE campaign_id = ? AND user_id = ?
-                    ''', (campaign_id, user_id))
+                        WHERE campaign_id = ? AND tenant_id = ? AND user_id = ?
+                    ''', (campaign_id, tenant_id, user_id))
                     existing = cursor.fetchone()
                     if existing:
                         if existing[1] == 'failed':
@@ -988,8 +1133,8 @@ class OutreachManager:
                 if username:
                     cursor.execute('''
                         SELECT id, status FROM outreach_contacts
-                        WHERE campaign_id = ? AND username = ?
-                    ''', (campaign_id, username))
+                        WHERE campaign_id = ? AND tenant_id = ? AND username = ?
+                    ''', (campaign_id, tenant_id, username))
                     existing = cursor.fetchone()
                     if existing:
                         if existing[1] == 'failed':
@@ -1008,9 +1153,10 @@ class OutreachManager:
                 # Вставляем новый контакт
                 cursor.execute('''
                     INSERT INTO outreach_contacts 
-                    (campaign_id, phone, username, access_hash, name, company, position, source_file, status, user_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+                    (tenant_id, campaign_id, phone, username, access_hash, name, company, position, source_file, status, user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
                 ''', (
+                    tenant_id,
                     campaign_id, 
                     phone,
                     username,
@@ -1028,8 +1174,8 @@ class OutreachManager:
             cursor.execute('''
                 UPDATE outreach_campaigns 
                 SET total_contacts = total_contacts + ? 
-                WHERE id = ?
-            ''', (imported, campaign_id))
+                WHERE id = ? AND tenant_id = ?
+            ''', (imported, campaign_id, tenant_id))
             
             conn.commit()
             logger.info(f"Импорт завершен: добавлено {imported}, пропущено {skipped}")
@@ -1037,7 +1183,7 @@ class OutreachManager:
             raise Exception("Импорт не выполнен: нет валидных контактов для добавления (или все в blacklist/дубликаты)")
         return {'imported': imported, 'skipped': skipped}
     
-    def get_campaign_contacts(self, campaign_id: int, limit: int = 50, offset: int = 0) -> dict:
+    def get_campaign_contacts(self, campaign_id: int, limit: int = 50, offset: int = 0, tenant_id: int = 1) -> dict:
         """Получение контактов кампании с пагинацией и агрегированной статистикой."""
         limit = max(1, min(int(limit or 50), 1000))
         offset = max(0, int(offset or 0))
@@ -1046,16 +1192,16 @@ class OutreachManager:
             cursor.execute('''
                 SELECT COUNT(*)
                 FROM outreach_contacts
-                WHERE campaign_id = ?
-            ''', (campaign_id,))
+                WHERE campaign_id = ? AND tenant_id = ?
+            ''', (campaign_id, tenant_id))
             total = int(cursor.fetchone()[0] or 0)
 
             cursor.execute('''
                 SELECT status, COUNT(*)
                 FROM outreach_contacts
-                WHERE campaign_id = ?
+                WHERE campaign_id = ? AND tenant_id = ?
                 GROUP BY status
-            ''', (campaign_id,))
+            ''', (campaign_id, tenant_id))
             counts_raw = cursor.fetchall()
             status_counts = {
                 'new': 0,
@@ -1082,6 +1228,7 @@ class OutreachManager:
                     GROUP BY contact_id
                 ) ls ON ls.contact_id = oc.id
                 WHERE oc.campaign_id = ?
+                  AND oc.tenant_id = ?
                 ORDER BY 
                     CASE oc.status
                         WHEN 'new' THEN 1
@@ -1094,7 +1241,7 @@ class OutreachManager:
                     oc.id DESC
                 LIMIT ?
                 OFFSET ?
-            ''', (campaign_id, limit, offset))
+            ''', (campaign_id, tenant_id, limit, offset))
             
             contacts = []
             for row in cursor.fetchall():
@@ -1123,25 +1270,35 @@ class OutreachManager:
                 'status_counts': status_counts
             }
     
-    def get_templates(self) -> List[dict]:
+    def get_templates(self, tenant_id: int = 1) -> List[dict]:
         """Получение списка шаблонов"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, name, template_text FROM outreach_templates ORDER BY name')
+            cursor.execute(
+                'SELECT id, name, template_text FROM outreach_templates WHERE tenant_id = ? ORDER BY name',
+                (tenant_id,)
+            )
             return [{'id': r[0], 'name': r[1], 'text': r[2]} for r in cursor.fetchall()]
     
-    def save_template(self, name: str, text: str):
+    def save_template(self, name: str, text: str, tenant_id: int = 1):
         """Сохранение шаблона"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO outreach_templates (name, template_text)
-                VALUES (?, ?)
-                ON CONFLICT(name) DO UPDATE SET template_text = ?
-            ''', (name, text, text))
+            cursor.execute('SELECT id FROM outreach_templates WHERE tenant_id = ? AND name = ?', (tenant_id, name))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    'UPDATE outreach_templates SET template_text = ? WHERE id = ?',
+                    (text, row[0])
+                )
+            else:
+                cursor.execute(
+                    'INSERT INTO outreach_templates (tenant_id, name, template_text) VALUES (?, ?, ?)',
+                    (tenant_id, name, text)
+                )
             conn.commit()
     
-    def update_campaign_status(self, campaign_id: int, status: str):
+    def update_campaign_status(self, campaign_id: int, status: str, tenant_id: int = 1):
         """Обновление статуса кампании"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -1149,8 +1306,8 @@ class OutreachManager:
             cursor.execute('''
                 UPDATE outreach_campaigns 
                 SET status = ?, started_at = COALESCE(started_at, ?)
-                WHERE id = ?
-            ''', (status, now, campaign_id))
+                WHERE id = ? AND tenant_id = ?
+            ''', (status, now, campaign_id, tenant_id))
             conn.commit()
 
 

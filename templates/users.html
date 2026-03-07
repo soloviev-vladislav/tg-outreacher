@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Пользователи</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link">Проверка</a>
+            <a href="/outreach" class="nav-link">Рассылки</a>
+            <a href="/accounts" class="nav-link">Аккаунты</a>
+            <a href="/proxies" class="nav-link">Прокси</a>
+            <a href="/users" class="nav-link active">Пользователи</a>
+        </div>
+
+        <h1 class="page-title">Пользователи и нагрузка</h1>
+
+        <div class="stats-row" id="usersStats">
+            <div class="stat-item">
+                <div class="stat-value" id="usersTotal">0</div>
+                <div class="stat-label">Пользователей</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="usersActive">0</div>
+                <div class="stat-label">Активных</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="usersPending">0</div>
+                <div class="stat-label">Ожидают модерации</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="sendsToday">0</div>
+                <div class="stat-label">Отправок сегодня</div>
+            </div>
+        </div>
+
+        <div class="btn-group" style="margin-bottom: 14px;">
+            <button class="btn btn-primary" onclick="openCreateUserModal()">Создать пользователя</button>
+            <button class="btn" onclick="reloadUsers()">Обновить</button>
+        </div>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Пользователь</th>
+                        <th>Роль</th>
+                        <th>Статус</th>
+                        <th>Сессии</th>
+                        <th>Кампании</th>
+                        <th>Отправки</th>
+                        <th>Сегодня</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="usersTableBody">
+                    <tr><td colspan="8" style="text-align:center; padding:40px;">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="modal" id="createUserModal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px;">Создать пользователя</h3>
+            <div class="form-group">
+                <label>Логин</label>
+                <input id="newUserName" class="form-control" />
+            </div>
+            <div class="form-group">
+                <label>Пароль</label>
+                <input id="newUserPassword" type="password" class="form-control" />
+            </div>
+            <div class="form-group">
+                <label>Роль</label>
+                <select id="newUserRole" class="form-control">
+                    <option value="user">user</option>
+                    <option value="admin">admin</option>
+                </select>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="createUser()">Создать</button>
+                <button class="btn" onclick="closeCreateUserModal()">Отмена</button>
+            </div>
+            <div id="createUserError" class="muted-text" style="margin-top:10px; color:#c0392b;"></div>
+        </div>
+    </div>
+
+    <script src="/static/users.js"></script>
+</body>
+</html>

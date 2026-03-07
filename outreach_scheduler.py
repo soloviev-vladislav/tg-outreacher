@@ -134,12 +134,14 @@ def render_spintax(text: str, rng=None, max_replacements: int = 200) -> str:
 
 class OutreachScheduler:
     """Планировщик рассылок для аутрич кампаний"""
-    DEFAULT_TARGET_CHAT = "aihubco"
+    DEFAULT_TARGET_CHAT = ""
     POLL_INTERVAL_SECONDS = 15
     WARM_PARTICIPANTS_LIMIT = 3000
     WARM_MESSAGES_LIMIT = 800
-    CAMPAIGN_LOCK_TTL_MINUTES = 10
+    CAMPAIGN_LOCK_TTL_MINUTES = 1
     FOLLOWUP_MIN_INTERVAL_SECONDS = 120
+    MAX_INITIAL_PER_CYCLE = 1
+    MAX_PARALLEL_CAMPAIGNS = 8
     
     def __init__(self, db_path='checker.db', sessions_dir='sessions'):
         self.db = Database(db_path)
@@ -149,7 +151,7 @@ class OutreachScheduler:
         self.running = False
         self.accounts_cache = {}
         self.rotation_state = {}
-        self.target_chat_cache = {'value': None}
+        self.target_chat_cache = {}
         self.target_chat_warm_state = {}
         self.contact_card_index = {}
         self.deep_warm_attempted = set()
@@ -157,6 +159,25 @@ class OutreachScheduler:
         self.rng = random.SystemRandom()
         # account_phone -> datetime когда можно отправить следующий фоллоуап
         self.followup_next_allowed_at = {}
+        # (tenant_id, campaign_id) -> datetime когда можно отправить следующее первичное
+        self.next_initial_send_at = {}
+        self.account_send_locks: Dict[tuple, asyncio.Lock] = {}
+
+    @staticmethod
+    def _account_cache_key(tenant_id: int, account_phone: str):
+        return (int(tenant_id), str(account_phone))
+
+    @staticmethod
+    def _campaign_cache_key(tenant_id: int, campaign_id: int):
+        return (int(tenant_id), int(campaign_id))
+
+    def _account_lock(self, tenant_id: int, account_phone: str) -> asyncio.Lock:
+        key = self._account_cache_key(tenant_id, account_phone)
+        lock = self.account_send_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.account_send_locks[key] = lock
+        return lock
 
     def _read_env_file_value(self, key: str) -> str:
         env_path = '.env'
@@ -175,9 +196,9 @@ class OutreachScheduler:
             return ''
         return ''
 
-    def _resolve_api_credentials(self):
-        api_id = str(self.db.get_config('api_id') or '').strip()
-        api_hash = str(self.db.get_config('api_hash') or '').strip()
+    def _resolve_api_credentials(self, tenant_id: int):
+        api_id = str(self.db.get_config('api_id', tenant_id=tenant_id) or '').strip()
+        api_hash = str(self.db.get_config('api_hash', tenant_id=tenant_id) or '').strip()
         if api_id and api_hash:
             return api_id, api_hash
 
@@ -226,6 +247,8 @@ class OutreachScheduler:
         self.contact_card_index.clear()
         self.deep_warm_attempted.clear()
         self.followup_next_allowed_at.clear()
+        self.next_initial_send_at.clear()
+        self.account_send_locks.clear()
 
     def _get_followup_min_interval_seconds(self) -> int:
         value = os.getenv('FOLLOWUP_MIN_INTERVAL_SECONDS', '').strip()
@@ -251,7 +274,7 @@ class OutreachScheduler:
             except ValueError:
                 return None
 
-    def _get_followup_wait_seconds(self, account_phone: str) -> int:
+    def _get_followup_wait_seconds(self, tenant_id: int, account_phone: str) -> int:
         """
         Минимальный интервал между фоллоуапами с одного аккаунта.
         Проверяем сначала in-memory таймер, затем БД (на случай рестарта процесса).
@@ -261,7 +284,8 @@ class OutreachScheduler:
             return 0
 
         now = datetime.now()
-        cached_next = self.followup_next_allowed_at.get(account_phone)
+        account_key = self._account_cache_key(tenant_id, account_phone)
+        cached_next = self.followup_next_allowed_at.get(account_key)
         if cached_next and cached_next > now:
             return int((cached_next - now).total_seconds())
 
@@ -273,8 +297,10 @@ class OutreachScheduler:
                 JOIN outreach_contacts oc ON oc.id = c.contact_id
                 WHERE c.direction = 'outgoing'
                   AND COALESCE(c.is_followup, 0) = 1
+                  AND c.tenant_id = ?
+                  AND oc.tenant_id = ?
                   AND oc.account_used = ?
-            ''', (account_phone,))
+            ''', (tenant_id, tenant_id, account_phone))
             row = cursor.fetchone()
 
         last_sent_at = self._parse_db_datetime(row[0] if row else None)
@@ -282,35 +308,31 @@ class OutreachScheduler:
             return 0
 
         next_allowed = last_sent_at + timedelta(seconds=min_interval)
-        self.followup_next_allowed_at[account_phone] = next_allowed
+        self.followup_next_allowed_at[account_key] = next_allowed
         if next_allowed <= now:
             return 0
         return int((next_allowed - now).total_seconds())
 
-    def _mark_followup_sent_now(self, account_phone: str):
+    def _mark_followup_sent_now(self, tenant_id: int, account_phone: str):
         min_interval = self._get_followup_min_interval_seconds()
         if min_interval <= 0:
             return
-        self.followup_next_allowed_at[account_phone] = datetime.now() + timedelta(seconds=min_interval)
+        account_key = self._account_cache_key(tenant_id, account_phone)
+        self.followup_next_allowed_at[account_key] = datetime.now() + timedelta(seconds=min_interval)
 
-    def _get_target_chat(self) -> Optional[str]:
-        form_data = self.db.load_form_data()
+    def _get_target_chat(self, tenant_id: int) -> Optional[str]:
+        cached = self.target_chat_cache.get(int(tenant_id))
+        if cached is not None:
+            return cached
+
+        form_data = self.db.load_form_data(tenant_id=tenant_id)
         target_chat = str(form_data.get('target_chat') or '').strip()
         if not target_chat:
-            target_chat = str(self.db.get_config('outreach_target_chat') or '').strip()
+            target_chat = str(self.db.get_config('outreach_target_chat', tenant_id=tenant_id) or '').strip()
         if not target_chat:
             target_chat = str(os.getenv('OUTREACH_TARGET_CHAT', '')).strip()
-        if not target_chat:
-            target_chat = self.DEFAULT_TARGET_CHAT
 
-        # Сохраняем дефолт для следующих запусков.
-        try:
-            if target_chat:
-                self.db.set_config('outreach_target_chat', target_chat)
-        except Exception:
-            pass
-
-        self.target_chat_cache['value'] = target_chat
+        self.target_chat_cache[int(tenant_id)] = target_chat or self.DEFAULT_TARGET_CHAT
         return target_chat or None
 
     @staticmethod
@@ -361,21 +383,16 @@ class OutreachScheduler:
             logger.warning(f"[{account_phone}] ensure target chat failed {chat_ref}: {e}")
             return False
 
-    async def _warm_entities_from_target_chat(self, account_phone: str, client):
+    async def _warm_entities_from_target_chat(self, tenant_id: int, account_phone: str, client, use_target_chat: bool = True):
         """
         Прогрев entity-кэша из целевого чата:
         1) get_entity(target_chat)
         2) get_participants для кэша участников
         3) iter_messages и индекс визиток (phone -> user_id)
         """
-        if self.target_chat_warm_state.get(account_phone):
+        account_key = self._account_cache_key(tenant_id, account_phone)
+        if self.target_chat_warm_state.get(account_key):
             return
-
-        target_chat = self._get_target_chat()
-        if not target_chat:
-            self.target_chat_warm_state[account_phone] = True
-            return
-        await self._ensure_account_in_target_chat(account_phone, client, target_chat)
 
         phone_to_user = {}
         user_to_phone = {}
@@ -420,11 +437,63 @@ class OutreachScheduler:
                     except Exception:
                         pass
 
-        try:
-            chat_entity = await client.get_entity(target_chat)
-        except Exception as e:
-            logger.warning(f"[{account_phone}] target_chat resolve failed ({target_chat}): {e}")
-            chat_entity = None
+        async def ingest_dialogs_fallback():
+            """Прогрев из последних диалогов/групп, если target_chat не задан или нерелевантен."""
+            nonlocal phone_to_user, user_to_phone, phone_to_entity, user_to_entity, user_to_input_peer
+            try:
+                dialogs = await client.get_dialogs(limit=200)
+                scanned_dialogs = 0
+                scanned_groups = 0
+                for dialog in dialogs:
+                    if scanned_dialogs >= 80:
+                        break
+                    scanned_dialogs += 1
+                    entity = getattr(dialog, 'entity', None)
+                    if not entity:
+                        continue
+
+                    is_group_like = bool(getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False))
+                    if is_group_like and scanned_groups < 20:
+                        try:
+                            participants = await client.get_participants(entity, limit=500)
+                            scanned_groups += 1
+                            for participant in participants:
+                                uid = self._parse_int(getattr(participant, 'id', None))
+                                if not uid:
+                                    continue
+                                user_to_entity[uid] = participant
+                                participant_phone = self._normalize_phone(getattr(participant, 'phone', None))
+                                if participant_phone:
+                                    user_to_phone[uid] = participant_phone
+                                    phone_to_user[participant_phone] = uid
+                                    phone_to_entity[participant_phone] = participant
+                                participant_access_hash = self._parse_int(getattr(participant, 'access_hash', None))
+                                if participant_access_hash:
+                                    user_to_input_peer[uid] = InputPeerUser(uid, participant_access_hash)
+                        except Exception:
+                            pass
+
+                    try:
+                        await ingest_contact_cards(entity, limit_messages=150)
+                    except Exception:
+                        pass
+
+                logger.info(
+                    f"[{account_phone}] fallback dialog warm complete: dialogs={scanned_dialogs}, "
+                    f"groups={scanned_groups}, cards={len(phone_to_user)}, users={len(user_to_entity)}"
+                )
+            except Exception as e:
+                logger.warning(f"[{account_phone}] fallback dialogs warm failed: {e}")
+
+        target_chat = self._get_target_chat(tenant_id) if use_target_chat else None
+        chat_entity = None
+        if target_chat:
+            await self._ensure_account_in_target_chat(account_phone, client, target_chat)
+            try:
+                chat_entity = await client.get_entity(target_chat)
+            except Exception as e:
+                logger.warning(f"[{account_phone}] target_chat resolve failed ({target_chat}): {e}")
+                chat_entity = None
 
         if chat_entity is not None:
             try:
@@ -450,31 +519,18 @@ class OutreachScheduler:
                 await ingest_contact_cards(chat_entity)
             except Exception as e:
                 logger.warning(f"[{account_phone}] contact-card scan failed: {e}")
-        else:
-            # Fallback: сканируем последние диалоги и собираем визитки без target_chat.
-            try:
-                dialogs = await client.get_dialogs(limit=150)
-                scanned = 0
-                for dialog in dialogs:
-                    if scanned >= 60:
-                        break
-                    try:
-                        await ingest_contact_cards(dialog.entity, limit_messages=200)
-                        scanned += 1
-                    except Exception:
-                        continue
-                logger.info(f"[{account_phone}] fallback dialog scan complete: dialogs={scanned}, cards={len(phone_to_user)}")
-            except Exception as e:
-                logger.warning(f"[{account_phone}] fallback dialogs scan failed: {e}")
 
-        self.contact_card_index[account_phone] = {
+        # Даже если target_chat задан, дополняем кеш из диалогов/групп.
+        await ingest_dialogs_fallback()
+
+        self.contact_card_index[account_key] = {
             'phone_to_user': phone_to_user,
             'user_to_phone': user_to_phone,
             'phone_to_entity': phone_to_entity,
             'user_to_entity': user_to_entity,
             'user_to_input_peer': user_to_input_peer
         }
-        self.target_chat_warm_state[account_phone] = True
+        self.target_chat_warm_state[account_key] = True
         if phone_to_user:
             logger.info(f"[{account_phone}] contact-card index loaded: {len(phone_to_user)}")
 
@@ -518,17 +574,19 @@ class OutreachScheduler:
             cursor.execute('''
                 SELECT COUNT(*) FROM conversations
                 WHERE campaign_id = ? AND direction = 'outgoing'
+                  AND tenant_id = ?
                   AND COALESCE(is_followup, 0) = 0
                   AND date(sent_at) = date('now')
-            ''', (campaign['id'],))
+            ''', (campaign['id'], campaign['tenant_id']))
             sent_today = cursor.fetchone()[0] or 0
 
             cursor.execute('''
                 SELECT COUNT(*) FROM conversations
                 WHERE campaign_id = ? AND direction = 'outgoing'
+                  AND tenant_id = ?
                   AND COALESCE(is_followup, 0) = 0
                   AND datetime(sent_at) >= datetime('now', '-1 hour')
-            ''', (campaign['id'],))
+            ''', (campaign['id'], campaign['tenant_id']))
             sent_last_hour = cursor.fetchone()[0] or 0
 
         daily_limit = int(campaign.get('daily_limit') or 10)
@@ -538,12 +596,12 @@ class OutreachScheduler:
         remaining_hourly = max(0, hourly_limit - sent_last_hour)
         return min(remaining_daily, remaining_hourly)
 
-    def _is_campaign_active(self, campaign_id: int) -> bool:
+    def _is_campaign_active(self, campaign_id: int, tenant_id: int) -> bool:
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT status FROM outreach_campaigns WHERE id = ?",
-                (campaign_id,)
+                "SELECT status FROM outreach_campaigns WHERE id = ? AND tenant_id = ?",
+                (campaign_id, tenant_id)
             )
             row = cursor.fetchone()
         return bool(row and row[0] == 'active')
@@ -553,80 +611,102 @@ class OutreachScheduler:
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT id, name, message_template, accounts, daily_limit,
+                SELECT id, tenant_id, name, message_template, accounts, daily_limit,
                        delay_min, delay_max, strategy, ai_enabled, ai_tone, schedule
                 FROM outreach_campaigns
                 WHERE status = 'active'
             ''')
             campaigns = cursor.fetchall()
         
+        campaign_payloads = []
         for campaign in campaigns:
-            campaign_payload = {
+            campaign_payloads.append({
                 'id': campaign[0],
-                'name': campaign[1],
-                'message_template': campaign[2],
-                'accounts': json.loads(campaign[3]),
-                'daily_limit': campaign[4],
-                'delay_min': campaign[5],
-                'delay_max': campaign[6],
-                'strategy': json.loads(campaign[7]) if campaign[7] else {"steps": []},
-                'ai_enabled': bool(campaign[8]),
-                'ai_tone': campaign[9],
-                'schedule': json.loads(campaign[10]) if campaign[10] else None
-            }
-            if not self._acquire_campaign_lock(campaign_payload['id']):
-                logger.info(f"Skip campaign {campaign_payload['id']} - locked by another scheduler")
-                continue
-            try:
-                await self.process_campaign(campaign_payload)
-            finally:
-                self._release_campaign_lock(campaign_payload['id'])
+                'tenant_id': campaign[1],
+                'name': campaign[2],
+                'message_template': campaign[3],
+                'accounts': json.loads(campaign[4]),
+                'daily_limit': campaign[5],
+                'delay_min': campaign[6],
+                'delay_max': campaign[7],
+                'strategy': json.loads(campaign[8]) if campaign[8] else {"steps": []},
+                'ai_enabled': bool(campaign[9]),
+                'ai_tone': campaign[10],
+                'schedule': json.loads(campaign[11]) if campaign[11] else None
+            })
 
-    def _acquire_campaign_lock(self, campaign_id: int) -> bool:
+        if not campaign_payloads:
+            return
+
+        try:
+            max_parallel = max(1, int(os.getenv('MAX_PARALLEL_CAMPAIGNS', '').strip() or self.MAX_PARALLEL_CAMPAIGNS))
+        except Exception:
+            max_parallel = self.MAX_PARALLEL_CAMPAIGNS
+
+        sem = asyncio.Semaphore(max_parallel)
+
+        async def _run_one(campaign_payload: Dict):
+            async with sem:
+                if not self._acquire_campaign_lock(campaign_payload['id'], campaign_payload['tenant_id']):
+                    logger.info(f"Skip campaign {campaign_payload['id']} - locked by another scheduler")
+                    return
+                try:
+                    await self.process_campaign(campaign_payload)
+                finally:
+                    self._release_campaign_lock(campaign_payload['id'], campaign_payload['tenant_id'])
+
+        await asyncio.gather(*[_run_one(payload) for payload in campaign_payloads])
+
+    def _acquire_campaign_lock(self, campaign_id: int, tenant_id: int) -> bool:
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT OR IGNORE INTO scheduler_campaign_locks (campaign_id, owner, locked_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-            ''', (campaign_id, self.lock_owner))
+                INSERT OR IGNORE INTO scheduler_campaign_locks (tenant_id, campaign_id, owner, locked_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (tenant_id, campaign_id, self.lock_owner))
             if cursor.rowcount == 1:
                 conn.commit()
                 return True
 
-            cursor.execute('SELECT owner FROM scheduler_campaign_locks WHERE campaign_id = ?', (campaign_id,))
+            cursor.execute(
+                'SELECT owner FROM scheduler_campaign_locks WHERE tenant_id = ? AND campaign_id = ?',
+                (tenant_id, campaign_id)
+            )
             row = cursor.fetchone()
             if row and row[0] == self.lock_owner:
                 cursor.execute('''
                     UPDATE scheduler_campaign_locks
                     SET locked_at = CURRENT_TIMESTAMP
-                    WHERE campaign_id = ? AND owner = ?
-                ''', (campaign_id, self.lock_owner))
+                    WHERE tenant_id = ? AND campaign_id = ? AND owner = ?
+                ''', (tenant_id, campaign_id, self.lock_owner))
                 conn.commit()
                 return True
 
             cursor.execute('''
                 UPDATE scheduler_campaign_locks
                 SET owner = ?, locked_at = CURRENT_TIMESTAMP
-                WHERE campaign_id = ?
+                WHERE tenant_id = ?
+                  AND campaign_id = ?
                   AND datetime(locked_at) <= datetime('now', ?)
-            ''', (self.lock_owner, campaign_id, f'-{self.CAMPAIGN_LOCK_TTL_MINUTES} minutes'))
+            ''', (self.lock_owner, tenant_id, campaign_id, f'-{self.CAMPAIGN_LOCK_TTL_MINUTES} minutes'))
             conn.commit()
             return cursor.rowcount == 1
 
-    def _release_campaign_lock(self, campaign_id: int):
+    def _release_campaign_lock(self, campaign_id: int, tenant_id: int):
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 DELETE FROM scheduler_campaign_locks
-                WHERE campaign_id = ? AND owner = ?
-            ''', (campaign_id, self.lock_owner))
+                WHERE tenant_id = ? AND campaign_id = ? AND owner = ?
+            ''', (tenant_id, campaign_id, self.lock_owner))
             conn.commit()
     
     async def process_campaign(self, campaign: Dict):
         """Обработка конкретной кампании"""
         logger.info(f"Processing campaign: {campaign['name']}")
+        tenant_id = int(campaign['tenant_id'])
 
-        blacklisted_blocked = self._apply_blacklist_to_campaign(campaign['id'])
+        blacklisted_blocked = self._apply_blacklist_to_campaign(campaign['id'], tenant_id)
 
         ignored_marked = self._mark_ignored_contacts(campaign)
 
@@ -645,16 +725,17 @@ class OutreachScheduler:
                 FROM outreach_contacts oc
                 LEFT JOIN conversations m ON oc.id = m.contact_id
                 WHERE oc.campaign_id = ? 
+                  AND oc.tenant_id = ?
                   AND oc.status = 'ignored'
-                  AND (oc.user_id IS NULL OR oc.user_id NOT IN (SELECT user_id FROM outreach_blacklist))
+                  AND (oc.user_id IS NULL OR oc.user_id NOT IN (SELECT user_id FROM outreach_blacklist WHERE tenant_id = ?))
                   AND (oc.user_id IS NOT NULL OR oc.username IS NOT NULL OR oc.phone IS NOT NULL)
                   AND NOT EXISTS (
                       SELECT 1 FROM conversations 
-                      WHERE contact_id = oc.id AND direction = 'incoming'
+                      WHERE contact_id = oc.id AND direction = 'incoming' AND tenant_id = ?
                   )
                 GROUP BY oc.id
                 LIMIT 500
-            ''', (campaign['id'],))
+            ''', (campaign['id'], tenant_id, tenant_id, tenant_id))
             followup_contacts = cursor.fetchall()
         followup_candidates = len(followup_contacts)
         followup_sent = 0
@@ -662,12 +743,12 @@ class OutreachScheduler:
         # Сначала отправляем фолоуапы (они НЕ учитываются в лимитах отправки),
         # затем первичные сообщения в рамках дневных/часовых лимитов кампании.
         for contact in followup_contacts:
-            if not self._is_campaign_active(campaign['id']):
+            if not self._is_campaign_active(campaign['id'], tenant_id):
                 logger.info(f"Campaign {campaign['id']} paused/stopped during followup batch")
                 return
             account_used = contact[8] if len(contact) > 8 else None
             if account_used:
-                wait_left = self._get_followup_wait_seconds(account_used)
+                wait_left = self._get_followup_wait_seconds(tenant_id, account_used)
                 if wait_left > 0:
                     continue
             ordered_accounts = self._get_rotated_accounts(
@@ -689,25 +770,40 @@ class OutreachScheduler:
             )
             return
 
+        campaign_key = self._campaign_cache_key(tenant_id, campaign['id'])
+        now_dt = datetime.now()
+        next_allowed_dt = self.next_initial_send_at.get(campaign_key)
+        if next_allowed_dt and next_allowed_dt > now_dt:
+            wait_left = int((next_allowed_dt - now_dt).total_seconds())
+            logger.info(f"Campaign {campaign['id']} initial throttle active ({wait_left}s left)")
+            logger.info(
+                f"Campaign {campaign['id']} summary: blacklisted_blocked={blacklisted_blocked}, ignored_marked={ignored_marked}, "
+                f"followup={followup_sent}/{followup_candidates}, new=0/0, slots_left={slots_left}"
+            )
+            return
+
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT oc.id, oc.phone, oc.name, oc.company, oc.position, oc.user_id, oc.username, oc.access_hash
                 FROM outreach_contacts oc
-                WHERE oc.campaign_id = ? AND oc.status = 'new'
-                  AND (oc.user_id IS NULL OR oc.user_id NOT IN (SELECT user_id FROM outreach_blacklist))
+                WHERE oc.campaign_id = ? AND oc.tenant_id = ? AND oc.status = 'new'
+                  AND (oc.user_id IS NULL OR oc.user_id NOT IN (SELECT user_id FROM outreach_blacklist WHERE tenant_id = ?))
                   AND (oc.user_id IS NOT NULL OR oc.phone IS NOT NULL OR oc.username IS NOT NULL)
                 LIMIT ?
-            ''', (campaign['id'], slots_left))
+            ''', (campaign['id'], tenant_id, tenant_id, slots_left))
             new_contacts = cursor.fetchall()
         new_candidates = len(new_contacts)
         new_sent = 0
 
+        sent_this_cycle = 0
         for contact in new_contacts:
-            if not self._is_campaign_active(campaign['id']):
+            if not self._is_campaign_active(campaign['id'], tenant_id):
                 logger.info(f"Campaign {campaign['id']} paused/stopped during new batch")
                 return
             if slots_left <= 0:
+                break
+            if sent_this_cycle >= self.MAX_INITIAL_PER_CYCLE:
                 break
             ordered_accounts = self._get_rotated_accounts(
                 campaign['id'],
@@ -717,16 +813,19 @@ class OutreachScheduler:
             if sent_ok:
                 slots_left -= 1
                 new_sent += 1
+                sent_this_cycle += 1
                 delay_seconds = self._pick_delay_seconds(campaign)
                 if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
+                    self.next_initial_send_at[campaign_key] = datetime.now() + timedelta(seconds=delay_seconds)
+                else:
+                    self.next_initial_send_at[campaign_key] = datetime.now()
 
         logger.info(
             f"Campaign {campaign['id']} summary: blacklisted_blocked={blacklisted_blocked}, ignored_marked={ignored_marked}, "
             f"followup={followup_sent}/{followup_candidates}, new={new_sent}/{new_candidates}, slots_left={slots_left}"
         )
 
-    def _apply_blacklist_to_campaign(self, campaign_id: int) -> int:
+    def _apply_blacklist_to_campaign(self, campaign_id: int, tenant_id: int) -> int:
         """Остановить дальнейшую рассылку по контактам из blacklist."""
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
@@ -735,20 +834,21 @@ class OutreachScheduler:
                 SET status = 'failed',
                     notes = 'blacklisted'
                 WHERE campaign_id = ?
+                  AND tenant_id = ?
                   AND user_id IS NOT NULL
-                  AND user_id IN (SELECT user_id FROM outreach_blacklist)
+                  AND user_id IN (SELECT user_id FROM outreach_blacklist WHERE tenant_id = ?)
                   AND status IN ('new', 'sent', 'ignored')
-            ''', (campaign_id,))
+            ''', (campaign_id, tenant_id, tenant_id))
             conn.commit()
             return cursor.rowcount
 
-    def _is_blacklisted_user(self, user_id) -> bool:
+    def _is_blacklisted_user(self, tenant_id: int, user_id) -> bool:
         uid = self._parse_int(user_id)
         if not uid:
             return False
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM outreach_blacklist WHERE user_id = ?', (uid,))
+            cursor.execute('SELECT 1 FROM outreach_blacklist WHERE tenant_id = ? AND user_id = ?', (tenant_id, uid))
             return cursor.fetchone() is not None
 
     @staticmethod
@@ -789,6 +889,7 @@ class OutreachScheduler:
         N задается в настройках кампании: schedule.ignore_after_hours.
         """
         campaign_id = campaign['id']
+        tenant_id = int(campaign['tenant_id'])
         schedule = campaign.get('schedule') or {}
         try:
             ignore_after_hours = max(1, int(schedule.get('ignore_after_hours') or 24))
@@ -802,12 +903,14 @@ class OutreachScheduler:
                 UPDATE outreach_contacts
                 SET status = 'ignored'
                 WHERE campaign_id = ?
+                  AND tenant_id = ?
                   AND status = 'sent'
-                  AND (user_id IS NULL OR user_id NOT IN (SELECT user_id FROM outreach_blacklist))
+                  AND (user_id IS NULL OR user_id NOT IN (SELECT user_id FROM outreach_blacklist WHERE tenant_id = ?))
                   AND EXISTS (
                       SELECT 1
                       FROM conversations c_out
                       WHERE c_out.contact_id = outreach_contacts.id
+                        AND c_out.tenant_id = outreach_contacts.tenant_id
                         AND c_out.direction = 'outgoing'
                       GROUP BY c_out.contact_id
                       HAVING MAX(datetime(c_out.sent_at)) <= datetime('now', ?)
@@ -816,27 +919,30 @@ class OutreachScheduler:
                       SELECT 1
                       FROM conversations c_in
                       WHERE c_in.contact_id = outreach_contacts.id
+                        AND c_in.tenant_id = outreach_contacts.tenant_id
                         AND c_in.direction = 'incoming'
                   )
-            ''', (campaign_id, threshold_modifier))
+            ''', (campaign_id, tenant_id, tenant_id, threshold_modifier))
             conn.commit()
             return cursor.rowcount
 
     def _persist_account_usage(self, stats: AccountStats):
-        if not stats or not stats.phone:
+        tenant_id = self._parse_int(getattr(stats, 'tenant_id', None))
+        if not stats or not stats.phone or not tenant_id:
             return
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE account_stats
                 SET checked_today = ?, last_check_date = ?, last_check = CURRENT_TIMESTAMP
-                WHERE phone = ?
-            ''', (stats.checked_today, stats.last_check_date, stats.phone))
+                WHERE tenant_id = ? AND phone = ?
+            ''', (stats.checked_today, stats.last_check_date, tenant_id, stats.phone))
             conn.commit()
 
     def _transition_contact_status(
         self,
         contact_id: int,
+        tenant_id: int,
         new_status: str,
         allowed_from: Optional[List[str]] = None,
         extra_updates: Optional[Dict[str, object]] = None
@@ -850,8 +956,9 @@ class OutreachScheduler:
             set_parts.append(f"{key} = ?")
             params.append(value)
 
-        where = "id = ?"
+        where = "id = ? AND tenant_id = ?"
         params.append(contact_id)
+        params.append(tenant_id)
         if allowed_from:
             placeholders = ",".join("?" for _ in allowed_from)
             where += f" AND status IN ({placeholders})"
@@ -872,14 +979,15 @@ class OutreachScheduler:
         message = message.replace('{phone}', phone or '')
         return render_spintax(message, rng=self.rng)
     
-    async def get_account_client(self, account_phone: str):
+    async def get_account_client(self, tenant_id: int, account_phone: str):
         """Получение клиента для аккаунта (с прокси и fingerprint)"""
-        if account_phone in self.accounts_cache:
-            client, stats = self.accounts_cache[account_phone]
+        account_key = self._account_cache_key(tenant_id, account_phone)
+        if account_key in self.accounts_cache:
+            client, stats = self.accounts_cache[account_key]
             if client.is_connected():
                 return client, stats
         
-        api_id, api_hash = self._resolve_api_credentials()
+        api_id, api_hash = self._resolve_api_credentials(tenant_id)
         
         if not api_id or not api_hash:
             logger.error("API credentials not configured")
@@ -890,8 +998,8 @@ class OutreachScheduler:
             cursor.execute('''
                 SELECT session_name, proxy_id, account_type
                 FROM account_stats
-                WHERE phone = ?
-            ''', (account_phone,))
+                WHERE tenant_id = ? AND phone = ?
+            ''', (tenant_id, account_phone))
             row = cursor.fetchone()
             if not row:
                 return None, None
@@ -969,21 +1077,37 @@ class OutreachScheduler:
 
         # Дополнительный прогрев из целевого чата (где лежат визитки/участники).
         try:
-            await self._warm_entities_from_target_chat(account_phone, client)
+            # На этапе подключения не форсим target_chat: для user_id-баз это не нужно.
+            await self._warm_entities_from_target_chat(tenant_id, account_phone, client, use_target_chat=False)
         except Exception as e:
             logger.warning(f"[{account_phone}] target chat warm error: {e}")
         
         stats = AccountStats(session_name)
+        stats.tenant_id = tenant_id
         stats.phone = account_phone
         stats.account_type = account_type
         stats.proxy_id = proxy_id
-        db_stats = self.db.get_account_stats(account_phone)
+        db_stats = None
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT checked_today, last_check_date, outreach_daily_limit
+                FROM account_stats
+                WHERE tenant_id = ? AND phone = ?
+            ''', (tenant_id, account_phone))
+            row = cursor.fetchone()
+            if row:
+                db_stats = {
+                    'checked_today': row[0],
+                    'last_check_date': row[1],
+                    'outreach_daily_limit': row[2]
+                }
         if db_stats:
             stats.checked_today = db_stats.get('checked_today', 0)
             stats.last_check_date = db_stats.get('last_check_date', date.today().isoformat())
             stats.outreach_daily_limit = db_stats.get('outreach_daily_limit', 20)
         
-        self.accounts_cache[account_phone] = (client, stats)
+        self.accounts_cache[account_key] = (client, stats)
         return client, stats
 
     async def _get_campaign_accounts(self, campaign: Dict, respect_daily_limits: bool = True):
@@ -994,6 +1118,7 @@ class OutreachScheduler:
         selected = campaign.get('accounts') or []
         if not selected:
             return []
+        tenant_id = int(campaign['tenant_id'])
 
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
@@ -1003,8 +1128,9 @@ class OutreachScheduler:
                 SELECT phone, account_type, COALESCE(is_banned, 0), COALESCE(is_frozen, 0)
                 FROM account_stats
                 WHERE phone IN ({placeholders})
+                  AND tenant_id = ?
                 ''',
-                selected
+                [*selected, tenant_id]
             )
             rows = cursor.fetchall()
 
@@ -1017,7 +1143,7 @@ class OutreachScheduler:
             _, account_type, is_banned, is_frozen = row
             if account_type != 'outreach' or is_banned or is_frozen:
                 continue
-            client, stats = await self.get_account_client(phone)
+            client, stats = await self.get_account_client(tenant_id, phone)
             if not client or not stats:
                 continue
             # Если наступил новый день, can_use_today() обнулит счётчики только в памяти.
@@ -1110,8 +1236,9 @@ class OutreachScheduler:
         digits = str(abs(uid))
         return len(digits) == 11 and digits[0] in ('7', '8')
 
-    def _contact_from_card_index(self, account_phone: str, user_id=None, phone=None):
-        idx = self.contact_card_index.get(account_phone) or {}
+    def _contact_from_card_index(self, tenant_id: int, account_phone: str, user_id=None, phone=None):
+        account_key = self._account_cache_key(tenant_id, account_phone)
+        idx = self.contact_card_index.get(account_key) or {}
         phone_to_user = idx.get('phone_to_user') or {}
         user_to_phone = idx.get('user_to_phone') or {}
         phone_to_entity = idx.get('phone_to_entity') or {}
@@ -1135,7 +1262,14 @@ class OutreachScheduler:
             entity = user_to_entity[uid]
         return normalized_phone, uid, entity
 
-    async def _deep_warm_target_chat_for_user(self, account_phone: str, client, user_id: int, max_messages: int = 50000) -> bool:
+    async def _deep_warm_target_chat_for_user(
+        self,
+        tenant_id: int,
+        account_phone: str,
+        client,
+        user_id: int,
+        max_messages: int = 50000
+    ) -> bool:
         """
         Глубокий прогрев только при фейле отправки по user_id:
         сканирует историю target_chat и собирает contact-card индекс глубже,
@@ -1145,12 +1279,13 @@ class OutreachScheduler:
         if not uid:
             return False
 
-        target_chat = self._get_target_chat()
+        target_chat = self._get_target_chat(tenant_id)
         if not target_chat:
             return False
         await self._ensure_account_in_target_chat(account_phone, client, target_chat)
 
-        idx = self.contact_card_index.setdefault(account_phone, {
+        account_key = self._account_cache_key(tenant_id, account_phone)
+        idx = self.contact_card_index.setdefault(account_key, {
             'phone_to_user': {},
             'user_to_phone': {},
             'phone_to_entity': {},
@@ -1216,6 +1351,7 @@ class OutreachScheduler:
 
     async def _prime_cache_by_reading_target_chat_history(
         self,
+        tenant_id: int,
         account_phone: str,
         client,
         user_id: int,
@@ -1229,7 +1365,7 @@ class OutreachScheduler:
         if not uid:
             return False
 
-        target_chat = self._get_target_chat()
+        target_chat = self._get_target_chat(tenant_id)
         if not target_chat:
             logger.warning(f"[{account_phone}] target_chat is empty, cannot prime history cache")
             return False
@@ -1274,16 +1410,19 @@ class OutreachScheduler:
     async def _send_with_target_chat_retry(
         self,
         *,
+        tenant_id: int,
         account_phone: str,
         client,
         message: str,
         user_id=None,
         username=None,
         phone=None,
-        name=None
+        name=None,
+        allow_target_chat_retry: bool = True
     ) -> str:
         phone_candidate = phone or self._derive_phone_from_user_id_like_value(user_id)
         phone_candidate, user_id_candidate, _ = self._contact_from_card_index(
+            tenant_id,
             account_phone,
             user_id=user_id,
             phone=phone_candidate
@@ -1302,22 +1441,25 @@ class OutreachScheduler:
             uid = self._parse_int(user_id_candidate or user_id)
             if not uid or self._user_id_looks_like_phone(uid):
                 raise first_error
+            if not allow_target_chat_retry:
+                raise first_error
 
-            deep_key = (account_phone, uid)
+            deep_key = (tenant_id, account_phone, uid)
             if deep_key in self.deep_warm_attempted:
                 logger.info(f"[{account_phone}] deep warm already attempted for user {uid}, re-raising first error")
                 raise first_error
             self.deep_warm_attempted.add(deep_key)
 
-            found = await self._deep_warm_target_chat_for_user(account_phone, client, uid, max_messages=50000)
+            found = await self._deep_warm_target_chat_for_user(tenant_id, account_phone, client, uid, max_messages=50000)
             if not found:
                 logger.info(f"[{account_phone}] card-based deep warm did not find user {uid}, trying history prime")
-                primed = await self._prime_cache_by_reading_target_chat_history(account_phone, client, uid, max_messages=50000)
+                primed = await self._prime_cache_by_reading_target_chat_history(tenant_id, account_phone, client, uid, max_messages=50000)
                 if not primed:
                     logger.info(f"[{account_phone}] history prime failed for user {uid}, re-raising first error")
                     raise first_error
 
             phone_retry, uid_retry, _ = self._contact_from_card_index(
+                tenant_id,
                 account_phone,
                 user_id=uid,
                 phone=phone_candidate
@@ -1436,6 +1578,7 @@ class OutreachScheduler:
     
     async def send_message(self, campaign: Dict, contact: tuple, ordered_accounts: Optional[List[tuple]] = None):
         """Отправка сообщения контакту по Telegram ID"""
+        tenant_id = int(campaign['tenant_id'])
         # contact: (id, phone, name, company, position, user_id, username, access_hash)
         if len(contact) >= 8:
             contact_id, phone, name, company, position, user_id, username, access_hash = contact
@@ -1447,9 +1590,10 @@ class OutreachScheduler:
         if not user_id and not username and not phone:
             logger.warning(f"Contact {contact_id} has no user_id/username/phone, skipping")
             return False
-        if self._is_blacklisted_user(user_id):
+        if self._is_blacklisted_user(tenant_id, user_id):
             self._transition_contact_status(
                 contact_id=contact_id,
+                tenant_id=tenant_id,
                 new_status='failed',
                 allowed_from=['new', 'sent', 'ignored'],
                 extra_updates={'notes': 'blacklisted'}
@@ -1478,16 +1622,20 @@ class OutreachScheduler:
             spam_recovery_used = False
             while True:
                 try:
-                    await self._warm_entities_from_target_chat(account_phone, client)
-                    route = await self._send_with_target_chat_retry(
-                        account_phone=account_phone,
-                        client=client,
-                        message=message,
-                        user_id=user_id,
-                        username=username,
-                        phone=phone,
-                        name=name
-                    )
+                    async with self._account_lock(tenant_id, account_phone):
+                        use_target_chat = not (self._parse_int(user_id) and not username and not phone)
+                        await self._warm_entities_from_target_chat(tenant_id, account_phone, client, use_target_chat=use_target_chat)
+                        route = await self._send_with_target_chat_retry(
+                            tenant_id=tenant_id,
+                            account_phone=account_phone,
+                            client=client,
+                            message=message,
+                            user_id=user_id,
+                            username=username,
+                            phone=phone,
+                            name=name,
+                            allow_target_chat_retry=use_target_chat
+                        )
 
                     # Первичные сообщения расходуют лимит аккаунта outreach.
                     stats.increment_checked(is_test=False)
@@ -1495,6 +1643,7 @@ class OutreachScheduler:
 
                     status_changed = self._transition_contact_status(
                         contact_id=contact_id,
+                        tenant_id=tenant_id,
                         new_status='sent',
                         allowed_from=['new'],
                         extra_updates={
@@ -1512,15 +1661,15 @@ class OutreachScheduler:
                         cursor = conn.cursor()
                         cursor.execute('''
                             INSERT INTO conversations 
-                            (campaign_id, contact_id, direction, content, step_id)
-                            VALUES (?, ?, 'outgoing', ?, 1)
-                        ''', (campaign['id'], contact_id, message))
+                            (tenant_id, campaign_id, contact_id, direction, content, step_id)
+                            VALUES (?, ?, ?, 'outgoing', ?, 1)
+                        ''', (tenant_id, campaign['id'], contact_id, message))
 
                         cursor.execute('''
                             UPDATE outreach_campaigns 
                             SET sent_count = sent_count + 1
-                            WHERE id = ?
-                        ''', (campaign['id'],))
+                            WHERE id = ? AND tenant_id = ?
+                        ''', (campaign['id'], tenant_id))
 
                         conn.commit()
 
@@ -1544,6 +1693,7 @@ class OutreachScheduler:
             notes_text = ' | '.join(attempt_errors)[:500]
         self._transition_contact_status(
             contact_id=contact_id,
+            tenant_id=tenant_id,
             new_status='failed',
             allowed_from=['new'],
             extra_updates={'notes': notes_text}
@@ -1553,15 +1703,17 @@ class OutreachScheduler:
     
     async def send_followup(self, campaign: Dict, contact: tuple, ordered_accounts: Optional[List[tuple]] = None):
         """Отправка фолоуапа"""
+        tenant_id = int(campaign['tenant_id'])
         # contact: (id, phone, name, company, position, user_id, username, access_hash, account_used, last_message)
         contact_id, phone, name, company, position, user_id, username, access_hash, account_used, last_message = contact
         
         if not user_id and not username and not phone:
             logger.warning(f"Contact {contact_id} has no user_id/username/phone, skipping followup")
             return False
-        if self._is_blacklisted_user(user_id):
+        if self._is_blacklisted_user(tenant_id, user_id):
             self._transition_contact_status(
                 contact_id=contact_id,
+                tenant_id=tenant_id,
                 new_status='failed',
                 allowed_from=['new', 'sent', 'ignored'],
                 extra_updates={'notes': 'blacklisted'}
@@ -1591,9 +1743,9 @@ class OutreachScheduler:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT step_id FROM conversations
-                WHERE contact_id = ? AND direction = 'outgoing'
+                WHERE tenant_id = ? AND contact_id = ? AND direction = 'outgoing'
                 ORDER BY sent_at DESC LIMIT 1
-            ''', (contact_id,))
+            ''', (tenant_id, contact_id))
             row = cursor.fetchone()
             current_step = row[0] if row else 0
         
@@ -1630,7 +1782,7 @@ class OutreachScheduler:
             )
             return False
 
-        wait_left = self._get_followup_wait_seconds(account_used)
+        wait_left = self._get_followup_wait_seconds(tenant_id, account_used)
         if wait_left > 0:
             logger.info(
                 f"Followup throttled for account {account_used}: wait {wait_left}s"
@@ -1644,21 +1796,26 @@ class OutreachScheduler:
             spam_recovery_used = False
             while True:
                 try:
-                    await self._warm_entities_from_target_chat(account_phone, client)
-                    route = await self._send_with_target_chat_retry(
-                        account_phone=account_phone,
-                        client=client,
-                        message=message,
-                        user_id=user_id,
-                        username=username,
-                        phone=phone,
-                        name=name
-                    )
+                    async with self._account_lock(tenant_id, account_phone):
+                        use_target_chat = not (self._parse_int(user_id) and not username and not phone)
+                        await self._warm_entities_from_target_chat(tenant_id, account_phone, client, use_target_chat=use_target_chat)
+                        route = await self._send_with_target_chat_retry(
+                            tenant_id=tenant_id,
+                            account_phone=account_phone,
+                            client=client,
+                            message=message,
+                            user_id=user_id,
+                            username=username,
+                            phone=phone,
+                            name=name,
+                            allow_target_chat_retry=use_target_chat
+                        )
                     # Фоллоуапы не должны расходовать лимиты аккаунта outreach.
                     self._persist_account_usage(stats)
 
                     status_changed = self._transition_contact_status(
                         contact_id=contact_id,
+                        tenant_id=tenant_id,
                         new_status='sent',
                         allowed_from=['ignored'],
                         extra_updates={
@@ -1674,13 +1831,13 @@ class OutreachScheduler:
                         cursor = conn.cursor()
                         cursor.execute('''
                             INSERT INTO conversations 
-                            (campaign_id, contact_id, direction, content, step_id, is_followup)
-                            VALUES (?, ?, 'outgoing', ?, ?, TRUE)
-                        ''', (campaign['id'], contact_id, message, next_step['id']))
+                            (tenant_id, campaign_id, contact_id, direction, content, step_id, is_followup)
+                            VALUES (?, ?, ?, 'outgoing', ?, ?, TRUE)
+                        ''', (tenant_id, campaign['id'], contact_id, message, next_step['id']))
                         
                         conn.commit()
 
-                    self._mark_followup_sent_now(account_phone)
+                    self._mark_followup_sent_now(tenant_id, account_phone)
                     
                     logger.info(f"✅ Followup sent to user {user_id} via {route} using {account_phone}")
                     return True
@@ -1698,6 +1855,7 @@ class OutreachScheduler:
         if last_error:
             self._transition_contact_status(
                 contact_id=contact_id,
+                tenant_id=tenant_id,
                 new_status='failed',
                 allowed_from=['ignored'],
                 extra_updates={'notes': str(last_error)[:500]}
@@ -1710,10 +1868,11 @@ class OutreachScheduler:
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT DISTINCT c.campaign_id, c.contact_id, oc.account_used, oc.user_id
+                SELECT DISTINCT c.tenant_id, c.campaign_id, c.contact_id, oc.account_used, oc.user_id
                 FROM conversations c
                 JOIN outreach_contacts oc ON c.contact_id = oc.id
                 WHERE c.direction = 'outgoing'
+                  AND oc.tenant_id = c.tenant_id
                   AND oc.status IN ('sent', 'ignored')
                   AND (oc.user_id IS NOT NULL OR oc.username IS NOT NULL OR oc.phone IS NOT NULL)
                   AND c.sent_at > datetime('now', '-7 days')
@@ -1721,9 +1880,9 @@ class OutreachScheduler:
             ''')
             sent_messages = cursor.fetchall()
         
-        for campaign_id, contact_id, account_phone, user_id in sent_messages:
+        for tenant_id, campaign_id, contact_id, account_phone, user_id in sent_messages:
             try:
-                client, stats = await self.get_account_client(account_phone)
+                client, stats = await self.get_account_client(int(tenant_id), account_phone)
                 if not client:
                     continue
 
@@ -1732,8 +1891,8 @@ class OutreachScheduler:
                     cursor.execute('''
                         SELECT phone, username, access_hash
                         FROM outreach_contacts
-                        WHERE id = ?
-                    ''', (contact_id,))
+                        WHERE tenant_id = ? AND id = ?
+                    ''', (tenant_id, contact_id))
                     row = cursor.fetchone()
                     phone = row[0] if row else None
                     username = row[1] if row else None
@@ -1757,27 +1916,27 @@ class OutreachScheduler:
                         
                         cursor.execute('''
                             SELECT id FROM conversations 
-                            WHERE contact_id = ? AND message_id = ?
-                        ''', (contact_id, message.id))
+                            WHERE tenant_id = ? AND contact_id = ? AND message_id = ?
+                        ''', (tenant_id, contact_id, message.id))
                         
                         if not cursor.fetchone():
                             cursor.execute('''
                                 INSERT INTO conversations
-                                (campaign_id, contact_id, message_id, direction, content)
-                                VALUES (?, ?, ?, 'incoming', ?)
-                            ''', (campaign_id, contact_id, message.id, message.text))
+                                (tenant_id, campaign_id, contact_id, message_id, direction, content)
+                                VALUES (?, ?, ?, ?, 'incoming', ?)
+                            ''', (tenant_id, campaign_id, contact_id, message.id, message.text))
                             
                             cursor.execute('''
                                 UPDATE outreach_contacts
                                 SET status = 'replied', replied_at = CURRENT_TIMESTAMP
-                                WHERE id = ? AND status IN ('sent', 'ignored')
-                            ''', (contact_id,))
+                                WHERE tenant_id = ? AND id = ? AND status IN ('sent', 'ignored')
+                            ''', (tenant_id, contact_id))
                             
                             cursor.execute('''
                                 UPDATE outreach_campaigns
                                 SET reply_count = reply_count + 1
-                                WHERE id = ?
-                            ''', (campaign_id,))
+                                WHERE tenant_id = ? AND id = ?
+                            ''', (tenant_id, campaign_id))
                             
                             conn.commit()
                             

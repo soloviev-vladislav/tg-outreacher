@@ -13,6 +13,9 @@
             <a href="/outreach" class="nav-link">Рассылки</a>
             <a href="/accounts" class="nav-link">Аккаунты</a>
             <a href="/proxies" class="nav-link active">Прокси</a>
+            {% if current_user and current_user.role == 'admin' %}
+            <a href="/users" class="nav-link">Пользователи</a>
+            {% endif %}
         </div>
 
         <h1 class="page-title">Прокси</h1>

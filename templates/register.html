@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Регистрация | Telegram Outreach</title>
+    <style>
+        :root {
+            --bg: #f3f5f8;
+            --card: #ffffff;
+            --text: #1a1f2b;
+            --muted: #6c7484;
+            --accent: #2f6fed;
+            --accent-hover: #245ac2;
+            --border: #d8deea;
+            --danger: #c0392b;
+            --ok: #1f8b4c;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background: linear-gradient(180deg, #f7f9fc 0%, #eef2f8 100%);
+            color: var(--text);
+            display: grid;
+            place-items: center;
+            padding: 20px;
+        }
+        .card {
+            width: 100%;
+            max-width: 430px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 24px;
+            box-shadow: 0 8px 24px rgba(28, 41, 71, 0.08);
+        }
+        h1 { margin: 0 0 8px; font-size: 24px; }
+        p { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+        label { display: block; margin-bottom: 6px; font-size: 13px; color: #33405d; }
+        input {
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            font-size: 14px;
+            margin-bottom: 14px;
+            outline: none;
+        }
+        input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.12);
+        }
+        button {
+            width: 100%;
+            border: 0;
+            border-radius: 10px;
+            padding: 11px 14px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+            background: var(--accent);
+            cursor: pointer;
+        }
+        button:hover { background: var(--accent-hover); }
+        .message {
+            margin-top: 12px;
+            font-size: 13px;
+            min-height: 18px;
+        }
+        .err { color: var(--danger); }
+        .ok { color: var(--ok); }
+        .links {
+            margin-top: 14px;
+            font-size: 13px;
+            color: var(--muted);
+        }
+        .links a { color: var(--accent); text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Регистрация</h1>
+        <p>Аккаунт будет создан в ожидании ручной модерации админом.</p>
+        <form id="register-form">
+            <label for="username">Логин</label>
+            <input id="username" name="username" autocomplete="username" required />
+
+            <label for="password">Пароль (минимум 6 символов)</label>
+            <input id="password" name="password" type="password" autocomplete="new-password" required />
+
+            <button type="submit">Отправить заявку</button>
+            <div id="message" class="message"></div>
+        </form>
+        <div class="links">
+            Уже есть аккаунт: <a href="/login">войти</a>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('register-form');
+        const msgEl = document.getElementById('message');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            msgEl.className = 'message';
+            msgEl.textContent = '';
+
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+
+            try {
+                const response = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    msgEl.className = 'message err';
+                    msgEl.textContent = payload.error || 'Ошибка регистрации';
+                    return;
+                }
+                msgEl.className = 'message ok';
+                msgEl.textContent = 'Заявка отправлена. После активации админом можно войти.';
+                form.reset();
+            } catch (err) {
+                msgEl.className = 'message err';
+                msgEl.textContent = 'Сервер недоступен';
+            }
+        });
+    </script>
+</body>
+</html>

@@ -13,6 +13,9 @@
             <a href="/outreach" class="nav-link">Рассылки</a>
             <a href="/accounts" class="nav-link active">Аккаунты</a>
             <a href="/proxies" class="nav-link">Прокси</a>
+            {% if current_user and current_user.role == 'admin' %}
+            <a href="/users" class="nav-link">Пользователи</a>
+            {% endif %}
         </div>
 
         <h1 class="page-title">Аккаунты</h1>
@@ -39,6 +42,7 @@
         <div class="btn-group" style="margin-bottom:20px;">
             <button class="btn btn-primary" onclick="scanSessions()">Сканировать сессии</button>
             <button class="btn" id="uploadSessionBtn" onclick="openSessionUpload()">Загрузить .session</button>
+            <button class="btn" id="loginQrBtn" onclick="openQrLoginModal()">Войти по QR</button>
             <input type="file" id="sessionFileInput" accept=".session" style="display:none;" onchange="uploadSessionFile(event)">
             <button class="btn btn-success" onclick="testAllAccounts()">Тестировать все</button>
             <button class="btn" onclick="assignProxies()" id="assignProxiesBtn">Назначить прокси</button>
@@ -50,8 +54,6 @@
         <div class="grid-2" style="margin-bottom:20px;">
             <input type="text" id="searchInput" placeholder="🔍 Поиск по телефону..." class="form-control">
             <div style="display:flex; gap:10px;">
-                <button class="btn btn-small" onclick="selectFilteredAccounts()">Выделить все (фильтр)</button>
-                <button class="btn btn-small" onclick="clearSelection()">Снять выделение</button>
                 <select id="typeFilter" class="form-control">
                     <option value="">Все типы</option>
                     <option value="checker">Checker</option>
@@ -85,6 +87,32 @@
                     <tr><td colspan="9" style="text-align:center; padding:40px;">Загрузка...</td></tr>
                 </tbody>
             </table>
+        </div>
+    </div>
+
+    <!-- Модалка QR-логина -->
+    <div class="modal" id="qrLoginModal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:16px;">Вход в Telegram по QR</h3>
+            <div class="muted-text" style="margin-bottom: 12px;">
+                Откройте Telegram на телефоне: Настройки -> Устройства -> Подключить устройство, затем сканируйте QR.
+            </div>
+            <div style="display:flex; justify-content:center; margin-bottom: 12px;">
+                <img id="qrCodeImage" alt="QR code" style="max-width: 280px; width: 100%; border: 1px solid #e0e0e0; border-radius: 8px; display:none;">
+            </div>
+            <div id="qrLoginStatus" class="muted-text" style="margin-bottom: 10px;">Запуск...</div>
+            <div id="qr2faWrap" style="display:none;">
+                <div class="form-group">
+                    <label>Пароль 2FA</label>
+                    <input id="qr2faPassword" type="password" class="form-control" placeholder="Введите пароль Telegram 2FA">
+                </div>
+                <button class="btn btn-primary" onclick="submitQr2fa()">Подтвердить 2FA</button>
+            </div>
+            <div class="modal-actions">
+                <button class="btn" onclick="refreshQrLogin()">Обновить QR</button>
+                <button class="btn btn-primary" onclick="pollQrStatus()">Проверить вход</button>
+                <button class="btn" onclick="closeQrLoginModal()">Закрыть</button>
+            </div>
         </div>
     </div>
 
@@ -133,6 +161,7 @@
         let accounts = [];
         let selectedAccounts = new Set();
         let proxies = [];
+        let qrAuthState = { token: null };
 
         document.addEventListener('DOMContentLoaded', function() {
             loadAccounts();
@@ -169,8 +198,8 @@
             tbody.innerHTML = filtered.map(a => {
                 const checked = selectedAccounts.has(a.phone) ? 'checked' : '';
                 return `
-                <tr onclick="handleRowClick(event, '${a.phone}')" style="cursor:pointer;">
-                    <td onclick="event.stopPropagation()"><input type="checkbox" value="${a.phone}" ${checked} onchange="toggleSelect('${a.phone}')"></td>
+                <tr onclick="toggleRowSelection(event, '${a.phone}')" style="cursor:pointer;">
+                    <td onclick="event.stopPropagation()"><input type="checkbox" value="${a.phone}" ${checked} onchange="setSelected('${a.phone}', this.checked)"></td>
                     <td><strong>${a.phone || 'Неизвестно'}</strong></td>
                     <td><span class="badge ${a.account_type === 'outreach' ? 'badge-success' : ''}">${a.account_type}</span></td>
                     <td><span class="badge ${a.is_frozen ? 'badge-danger' : a.is_banned ? 'badge-warning' : 'badge-success'}">
@@ -192,12 +221,11 @@
             `}).join('');
         }
 
-        function handleRowClick(event, phone) {
-            if (event.target.type !== 'checkbox' && !event.target.classList.contains('btn')) {
-                const checkbox = event.currentTarget.querySelector('input[type="checkbox"]');
-                checkbox.checked = !checkbox.checked;
-                toggleSelect(phone);
-            }
+        function toggleRowSelection(event, phone) {
+            if (event.target.closest('button') || event.target.type === 'checkbox') return;
+            const shouldSelect = !selectedAccounts.has(phone);
+            setSelected(phone, shouldSelect);
+            updateTable();
         }
 
         function updateStats() {
@@ -232,12 +260,9 @@
             await loadAccounts();
         }
 
-        function toggleSelect(phone) {
-            if (selectedAccounts.has(phone)) {
-                selectedAccounts.delete(phone);
-            } else {
-                selectedAccounts.add(phone);
-            }
+        function setSelected(phone, checked) {
+            if (checked) selectedAccounts.add(phone);
+            else selectedAccounts.delete(phone);
             updateSelectAllCheckbox();
         }
 
@@ -253,8 +278,8 @@
 
         document.getElementById('selectAll').addEventListener('change', (e) => {
             const filtered = getFilteredAccounts();
-            if (e.target.checked) filtered.forEach(a => selectedAccounts.add(a.phone));
-            else filtered.forEach(a => selectedAccounts.delete(a.phone));
+            if (e.target.checked) filtered.forEach(a => setSelected(a.phone, true));
+            else filtered.forEach(a => setSelected(a.phone, false));
             updateTable();
         });
 
@@ -277,18 +302,6 @@
             });
         }
 
-        function selectFilteredAccounts() {
-            getFilteredAccounts().forEach(a => selectedAccounts.add(a.phone));
-            updateTable();
-            updateSelectAllCheckbox();
-        }
-
-        function clearSelection() {
-            selectedAccounts.clear();
-            updateTable();
-            updateSelectAllCheckbox();
-        }
-
         async function scanSessions() {
             const btn = event.target;
             btn.disabled = true;
@@ -302,6 +315,155 @@
         function openSessionUpload() {
             const input = document.getElementById('sessionFileInput');
             if (input) input.click();
+        }
+
+        function setQrStatus(text) {
+            const statusEl = document.getElementById('qrLoginStatus');
+            if (statusEl) statusEl.textContent = text || '';
+        }
+
+        function showQrImage(qrUrl) {
+            const img = document.getElementById('qrCodeImage');
+            if (!img) return;
+            if (!qrUrl) {
+                img.style.display = 'none';
+                img.removeAttribute('src');
+                return;
+            }
+            img.src = `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(qrUrl)}`;
+            img.style.display = 'block';
+        }
+
+        function showQr2fa(show) {
+            const wrap = document.getElementById('qr2faWrap');
+            if (!wrap) return;
+            wrap.style.display = show ? 'block' : 'none';
+        }
+
+        async function openQrLoginModal() {
+            const modal = document.getElementById('qrLoginModal');
+            modal.classList.add('active');
+            await refreshQrLogin();
+        }
+
+        async function refreshQrLogin() {
+            showQr2fa(false);
+            setQrStatus('Запуск QR-авторизации...');
+            showQrImage(null);
+
+            try {
+                if (qrAuthState.token) {
+                    await fetch('/api/accounts/qr/cancel', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ token: qrAuthState.token })
+                    });
+                }
+            } catch (e) {}
+
+            qrAuthState.token = null;
+
+            const response = await fetch('/api/accounts/qr/start', { method: 'POST' });
+            const data = await response.json();
+            if (!response.ok) {
+                setQrStatus(data.error || 'Ошибка старта QR');
+                return;
+            }
+
+            qrAuthState.token = data.token;
+            showQrImage(data.qr_url);
+            setQrStatus('Сканируйте QR-код в Telegram, затем нажмите "Проверить вход".');
+        }
+
+        async function pollQrStatus() {
+            if (!qrAuthState.token) return;
+            const response = await fetch(`/api/accounts/qr/status/${encodeURIComponent(qrAuthState.token)}`);
+            const data = await response.json();
+            if (!response.ok) {
+                setQrStatus(data.error || 'QR-сессия завершена');
+                return;
+            }
+
+            if (data.status === 'pending') {
+                setQrStatus('Ожидание сканирования и подтверждения в Telegram...');
+                return;
+            }
+
+            if (data.status === '2fa_required') {
+                showQr2fa(true);
+                showQrImage(null);
+                setQrStatus('Нужен пароль 2FA для завершения входа');
+                return;
+            }
+
+            if (data.status === 'done') {
+                showQr2fa(false);
+                showQrImage(null);
+                setQrStatus(`Готово: ${data.phone || ''}`);
+                await loadAccounts();
+                alert(`Сессия добавлена: ${data.phone || 'ok'}`);
+                closeQrLoginModal();
+                return;
+            }
+
+            if (data.status === 'expired') {
+                showQr2fa(false);
+                setQrStatus('QR-код истек. Нажмите "Обновить QR".');
+                return;
+            }
+
+            if (data.status === 'error') {
+                showQr2fa(false);
+                setQrStatus(data.message || 'Ошибка QR-авторизации');
+            }
+        }
+
+        async function submitQr2fa() {
+            const password = (document.getElementById('qr2faPassword').value || '').trim();
+            if (!password) {
+                alert('Введите пароль 2FA');
+                return;
+            }
+            if (!qrAuthState.token) {
+                alert('QR-сессия неактивна. Запустите заново.');
+                return;
+            }
+
+            const response = await fetch('/api/accounts/qr/2fa', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ token: qrAuthState.token, password })
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                setQrStatus(data.error || 'Ошибка 2FA');
+                return;
+            }
+
+            showQr2fa(false);
+            setQrStatus(`Готово: ${data.phone || ''}`);
+            await loadAccounts();
+            alert(`Сессия добавлена: ${data.phone || 'ok'}`);
+            closeQrLoginModal();
+        }
+
+        async function closeQrLoginModal() {
+            const modal = document.getElementById('qrLoginModal');
+            modal.classList.remove('active');
+            showQr2fa(false);
+            showQrImage(null);
+            setQrStatus('');
+            document.getElementById('qr2faPassword').value = '';
+            if (qrAuthState.token) {
+                try {
+                    await fetch('/api/accounts/qr/cancel', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ token: qrAuthState.token })
+                    });
+                } catch (e) {}
+                qrAuthState.token = null;
+            }
         }
 
         async function uploadSessionFile(e) {
