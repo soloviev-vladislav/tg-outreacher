@@ -4,9 +4,12 @@ import asyncio
 import json
 import os
 import sys
+import re
 
 from telethon import TelegramClient
 from telethon import functions
+from telethon import types
+from telethon import errors
 
 
 def _to_contact(p):
@@ -28,6 +31,43 @@ async def _try_join_public_chat(client: TelegramClient, entity):
         await client(functions.channels.JoinChannelRequest(entity))
     except Exception:
         pass
+
+
+def _extract_invite_hash(chat_ref: str):
+    ref = (chat_ref or '').strip()
+    m = re.search(r'(?:https?://)?t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)', ref, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _normalize_chat_ref(chat_ref: str):
+    ref = (chat_ref or '').strip()
+    if ref.startswith('https://t.me/') or ref.startswith('http://t.me/'):
+        tail = ref.split('t.me/', 1)[1].strip('/')
+        if tail and not tail.startswith('+') and not tail.startswith('joinchat/'):
+            return tail
+    return ref
+
+
+async def _resolve_entity(client: TelegramClient, chat_ref: str):
+    invite_hash = _extract_invite_hash(chat_ref)
+    if invite_hash:
+        try:
+            imported = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+            chats = getattr(imported, 'chats', None) or []
+            if chats:
+                return chats[0]
+        except errors.UserAlreadyParticipantError:
+            checked = await client(functions.messages.CheckChatInviteRequest(invite_hash))
+            if isinstance(checked, types.ChatInviteAlready):
+                return checked.chat
+            raise RuntimeError('Аккаунт уже в чате, но не удалось получить entity по invite-ссылке')
+        except errors.InviteHashInvalidError:
+            raise RuntimeError('Invite hash invalid')
+        except errors.InviteHashExpiredError:
+            raise RuntimeError('Invite hash expired')
+    return await client.get_entity(_normalize_chat_ref(chat_ref))
 
 
 async def _parse_participants(client: TelegramClient, entity):
@@ -63,7 +103,7 @@ async def _run(session: str, api_id: int, api_hash: str, chat: str, mode: str, m
     try:
         if not await client.is_user_authorized():
             raise RuntimeError(f"Service session is not authorized: {os.path.basename(session)}")
-        entity = await client.get_entity(chat)
+        entity = await _resolve_entity(client, chat)
         await _try_join_public_chat(client, entity)
 
         normalized_mode = (mode or "participants").strip().lower()
