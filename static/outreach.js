@@ -12,10 +12,26 @@ const SELECTED_CAMPAIGN_KEY = 'outreach_selected_campaign_id';
 
 document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
-    await Promise.all([loadAccounts(), loadTemplates(), loadBases(), loadCampaigns()]);
+    await initializePage();
     restoreSelectedCampaign();
     startAutoRefresh();
 });
+
+async function initializePage() {
+    const jobs = [
+        ['accounts', loadAccounts],
+        ['templates', loadTemplates],
+        ['bases', loadBases],
+        ['campaigns', loadCampaigns]
+    ];
+    await Promise.all(jobs.map(async ([name, fn]) => {
+        try {
+            await fn();
+        } catch (e) {
+            console.error(`init:${name}:`, e);
+        }
+    }));
+}
 
 function setupEventListeners() {
     document.getElementById('newCampaignBtn')?.addEventListener('click', newCampaign);
@@ -47,14 +63,18 @@ function setupEventListeners() {
 function startAutoRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(async () => {
-        await loadCampaigns();
-        if (currentCampaignId) {
-            const campaign = campaigns.find(c => c.id === currentCampaignId);
-            if (campaign) {
-                updateCampaignHeader(campaign);
-                updateActionButtons(campaign.status);
+        try {
+            await loadCampaigns();
+            if (currentCampaignId) {
+                const campaign = campaigns.find(c => c.id === currentCampaignId);
+                if (campaign) {
+                    updateCampaignHeader(campaign);
+                    updateActionButtons(campaign.status);
+                }
+                await Promise.all([loadContacts(currentCampaignId), refreshReadiness(currentCampaignId)]);
             }
-            await Promise.all([loadContacts(currentCampaignId), refreshReadiness(currentCampaignId)]);
+        } catch (e) {
+            console.error('auto_refresh_failed:', e);
         }
     }, 15000);
 }
