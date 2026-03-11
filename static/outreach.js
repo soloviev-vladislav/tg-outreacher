@@ -601,10 +601,11 @@ async function previewSpintax() {
 
 function contactStatusClass(status) {
     const st = String(status || '').toLowerCase();
-    if (st === 'replied') return 'badge-success';
-    if (st === 'sent') return 'badge';
-    if (st === 'ignored') return 'badge-warning';
-    if (st === 'failed') return 'badge-danger';
+    if (st === 'new') return 'badge-status-new';
+    if (st === 'sent') return 'badge-status-sent';
+    if (st === 'ignored') return 'badge-status-ignored';
+    if (st === 'replied') return 'badge-status-replied';
+    if (st === 'failed') return 'badge-status-failed';
     return 'badge';
 }
 
