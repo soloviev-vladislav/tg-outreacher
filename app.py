@@ -2906,6 +2906,24 @@ def _extract_usernames_from_result(link: str, title: str, snippet: str) -> list[
             candidates.add(u)
     return sorted(candidates)
 
+
+def _sync_campaign_from_base_safe(campaign_id: int, base_id, tenant_id: int, reset: bool = False):
+    if not base_id:
+        return {'imported': 0, 'skipped': 0}
+    try:
+        return outreach.sync_campaign_contacts_from_base(
+            campaign_id=campaign_id,
+            base_id=int(base_id),
+            tenant_id=tenant_id,
+            reset=reset
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to sync campaign %s from base %s (tenant=%s, reset=%s): %s",
+            campaign_id, base_id, tenant_id, reset, e
+        )
+        return {'imported': 0, 'skipped': 0, 'error': str(e)}
+
 @app.route('/api/bases/parse-chat', methods=['POST'])
 def parse_chat_to_base():
     tenant_id = get_current_tenant_id()
@@ -3303,6 +3321,12 @@ def create_outreach_campaign():
             created_by_user_id=actor_id if actor_id > 0 else None,
             base_id=base_id
         )
+        _sync_campaign_from_base_safe(
+            campaign_id=campaign_id,
+            base_id=base_id,
+            tenant_id=tenant_id,
+            reset=True
+        )
     except Exception as e:
         return jsonify({'error': str(e)}), 400
     return jsonify({'id': campaign_id})
@@ -3344,6 +3368,7 @@ def update_outreach_campaign(campaign_id):
         return jsonify({'error': 'Некорректные лимиты/задержка'}), 400
 
     try:
+        old_base_id = int(campaign.get('base_id') or 0)
         outreach.update_campaign(
             campaign_id=campaign_id,
             name=name,
@@ -3357,7 +3382,8 @@ def update_outreach_campaign(campaign_id):
             tenant_id=tenant_id,
             base_id=base_id
         )
-        if int(campaign.get('base_id') or 0) != int(base_id or 0):
+        new_base_id = int(base_id or 0)
+        if old_base_id != new_base_id:
             with sqlite3.connect(db.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute('DELETE FROM conversations WHERE tenant_id = ? AND campaign_id = ?', (tenant_id, campaign_id))
@@ -3368,6 +3394,28 @@ def update_outreach_campaign(campaign_id):
                     WHERE tenant_id = ? AND id = ?
                 ''', (tenant_id, campaign_id))
                 conn.commit()
+            _sync_campaign_from_base_safe(
+                campaign_id=campaign_id,
+                base_id=new_base_id if new_base_id > 0 else None,
+                tenant_id=tenant_id,
+                reset=True
+            )
+        elif new_base_id > 0:
+            # Если база не менялась, но контактов нет (например, после старого бага) — догружаем.
+            with sqlite3.connect(db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'SELECT COUNT(*) FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ?',
+                    (tenant_id, campaign_id)
+                )
+                current_contacts = int(cursor.fetchone()[0] or 0)
+            if current_contacts == 0:
+                _sync_campaign_from_base_safe(
+                    campaign_id=campaign_id,
+                    base_id=new_base_id,
+                    tenant_id=tenant_id,
+                    reset=True
+                )
     except Exception as e:
         return jsonify({'error': str(e)}), 400
     return jsonify({'status': 'updated', 'campaign': outreach.get_campaign(campaign_id, tenant_id=tenant_id)})
@@ -3414,6 +3462,25 @@ def get_campaign_contacts(campaign_id):
     campaign = get_campaign_for_current_user(campaign_id)
     if not campaign:
         return jsonify({'error': 'Campaign not found'}), 404
+    base_id = int(campaign.get('base_id') or 0)
+    if base_id > 0:
+        try:
+            with sqlite3.connect(db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'SELECT COUNT(*) FROM outreach_contacts WHERE tenant_id = ? AND campaign_id = ?',
+                    (tenant_id, campaign_id)
+                )
+                current_contacts = int(cursor.fetchone()[0] or 0)
+            if current_contacts == 0:
+                _sync_campaign_from_base_safe(
+                    campaign_id=campaign_id,
+                    base_id=base_id,
+                    tenant_id=tenant_id,
+                    reset=True
+                )
+        except Exception as e:
+            logger.error("Failed lazy sync for campaign %s: %s", campaign_id, e)
     limit = request.args.get('limit', 100, type=int)
     offset = request.args.get('offset', 0, type=int)
     return jsonify(outreach.get_campaign_contacts(campaign_id, limit=limit, offset=offset, tenant_id=tenant_id))
