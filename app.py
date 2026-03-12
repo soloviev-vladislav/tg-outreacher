@@ -27,6 +27,15 @@ try:
 except Exception:
     fcntl = None
 
+try:
+    # Под eventlet стандартный threading может быть monkey-patched (green threads).
+    # Для asyncio checker нужен настоящий OS-thread.
+    import eventlet.patcher as _eventlet_patcher
+    _native_threading = _eventlet_patcher.original('threading')
+    NativeThread = _native_threading.Thread
+except Exception:
+    NativeThread = threading.Thread
+
 def load_local_env(path='.env'):
     if not os.path.exists(path):
         return
@@ -708,9 +717,9 @@ def has_active_campaigns():
         logger.error(f"Failed to check active campaigns: {e}")
         return False
 
-class TelegramCheckerThread(threading.Thread):
+class TelegramCheckerThread(NativeThread):
     def __init__(self, api_id, api_hash, target_chat, phones_list, delay=2):
-        threading.Thread.__init__(self)
+        NativeThread.__init__(self)
         self.api_id = api_id
         self.api_hash = api_hash
         self.target_chat = target_chat
@@ -722,18 +731,9 @@ class TelegramCheckerThread(threading.Thread):
     def run(self):
         global checker_status
         try:
-            # В окружении gunicorn/eventlet поток может оказаться с уже активным event loop.
-            # В этом случае запускаем checker как задачу существующего loop.
-            try:
-                running_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                running_loop = None
-
-            if running_loop and running_loop.is_running():
-                logger.warning("Checker thread: detected active event loop, scheduling run_checker as task")
-                running_loop.create_task(self.run_checker())
-                return
-
+            # Всегда запускаем отдельный event loop внутри checker-потока.
+            # Попытка планировать задачу в чужой loop приводила к зависанию статуса
+            # "running=true" без фактического выполнения проверки.
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
             self.loop.run_until_complete(self.run_checker())
@@ -748,13 +748,30 @@ class TelegramCheckerThread(threading.Thread):
                     self.loop.close()
                 except Exception:
                     pass
-        
+
     async def run_checker(self):
         global checker_status
         
         manager = TelegramAccountManager(self.api_id, self.api_hash, 'sessions')
-        
-        if not await manager.load_accounts(self.target_chat):
+        checker_status['start_time'] = datetime.now().isoformat()
+
+        try:
+            loaded = await asyncio.wait_for(
+                manager.load_accounts(self.target_chat),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            socketio.emit('error', {'message': 'Таймаут инициализации checker-аккаунтов (120с)'})
+            checker_status['running'] = False
+            socketio.emit('checker_stopped')
+            return
+        except Exception as e:
+            socketio.emit('error', {'message': f'Ошибка инициализации аккаунтов: {str(e)}'})
+            checker_status['running'] = False
+            socketio.emit('checker_stopped')
+            return
+
+        if not loaded:
             socketio.emit('error', {'message': 'Не удалось загрузить аккаунты'})
             checker_status['running'] = False
             return
@@ -797,8 +814,7 @@ class TelegramCheckerThread(threading.Thread):
         processed = 0
         total = len(self.phones_list)
         checker_status['total'] = total
-        checker_status['start_time'] = datetime.now().isoformat()
-        test_counter = 0
+        checker_status['start_time'] = checker_status.get('start_time') or datetime.now().isoformat()
         
         for i, phone in enumerate(self.phones_list):
             if not checker_status['running']:
@@ -842,7 +858,7 @@ class TelegramCheckerThread(threading.Thread):
                     avg_time = elapsed / processed
                     remaining = avg_time * (total - processed)
                     checker_status['estimated_time'] = remaining
-                except:
+                except Exception:
                     checker_status['estimated_time'] = None
             
             socketio.emit('progress_update', checker_status)
@@ -853,7 +869,6 @@ class TelegramCheckerThread(threading.Thread):
                 break
             
             client, stats = account_data
-            
             result = await manager.check_phone(client, stats, phone, is_test)
             
             if result is None:
@@ -944,6 +959,21 @@ class TelegramCheckerThread(threading.Thread):
         await manager.close_all()
         checker_status['running'] = False
         socketio.emit('checker_stopped')
+
+def _is_checker_thread_alive() -> bool:
+    global checker_process
+    try:
+        return bool(checker_process and checker_process.is_alive())
+    except Exception:
+        return False
+
+def _refresh_checker_running_flag():
+    """Сбрасывает залипший running, если checker-поток уже завершился."""
+    global checker_status
+    if checker_status.get('running') and not _is_checker_thread_alive():
+        checker_status['running'] = False
+        checker_status['estimated_time'] = None
+        checker_status['current_phone'] = checker_status.get('current_phone') or ''
 
 
 # ===== ОСНОВНЫЕ ЭНДПОИНТЫ =====
@@ -1363,6 +1393,7 @@ def api_delete_user(user_id: int):
 
 @app.route('/api/status')
 def get_status():
+    _refresh_checker_running_flag()
     return jsonify(checker_status)
 
 @app.route('/api/accounts')
@@ -2328,7 +2359,7 @@ async def join_chat_async():
 @app.route('/api/start', methods=['POST'])
 def start_checker():
     global checker_process, checker_status
-    
+    _refresh_checker_running_flag()
     if checker_status['running']:
         return jsonify({'error': 'Проверка уже запущена'}), 400
     
