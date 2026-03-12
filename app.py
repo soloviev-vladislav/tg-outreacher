@@ -1587,29 +1587,30 @@ def start_qr_account_auth():
         return jsonify({'error': str(e)}), 500
 
     qr_url = ''
-    started_ok = False
-    for _ in range(30):
+    worker_state = 'pending'
+    worker_message = ''
+    # QR может появляться не мгновенно (сетевые задержки/нагрузка Telegram),
+    # поэтому не считаем это ошибкой на старте и даем worker-у больше времени.
+    for _ in range(80):  # до ~20 сек
         state = _read_qr_worker_state(state_path)
+        worker_state = str(state.get('status') or 'pending').strip().lower()
+        worker_message = str(state.get('message') or state.get('error') or '').strip()
         qr_url = str(state.get('qr_url') or '').strip()
-        if qr_url:
-            started_ok = True
+        if qr_url or worker_state in ('done', '2fa_required', 'error', 'expired'):
             break
-        if state.get('status') in ('error', 'expired'):
-            break
-        time.sleep(0.1)
+        time.sleep(0.25)
 
-    if not started_ok:
+    if worker_state in ('error', 'expired'):
         try:
             os.kill(proc.pid, 15)
         except Exception:
             pass
-        state = _read_qr_worker_state(state_path)
-        message = state.get('message') or state.get('error') or 'Не удалось получить QR-код'
+        message = worker_message or 'Не удалось получить QR-код'
         return jsonify({'error': message}), 500
 
     with qr_auth_lock:
         qr_auth_sessions[token] = {
-            'status': 'pending',
+            'status': 'pending' if worker_state not in ('2fa_required',) else '2fa_required',
             'tenant_id': tenant_id,
             'actor_id': actor_id,
             'session_name': session_name,
@@ -1620,14 +1621,15 @@ def start_qr_account_auth():
             'worker_pid': int(proc.pid),
             'created_at': time.time(),
             'finished_at': None,
-            'message': ''
+            'message': worker_message
         }
 
     return jsonify({
-        'status': 'pending',
+        'status': 'pending' if worker_state not in ('2fa_required',) else '2fa_required',
         'token': token,
         'qr_url': qr_url,
-        'session_name': session_name
+        'session_name': session_name,
+        'message': worker_message
     })
 
 @app.route('/api/accounts/qr/status/<token>', methods=['GET'])

@@ -380,8 +380,12 @@
             }
 
             qrAuthState.token = data.token;
-            showQrImage(data.qr_url);
-            setQrStatus('Сканируйте QR-код в Telegram, затем нажмите "Проверить вход".');
+            if (data.qr_url) {
+                showQrImage(data.qr_url);
+                setQrStatus('Сканируйте QR-код в Telegram, затем нажмите "Проверить вход".');
+            } else {
+                setQrStatus('Генерируем QR-код... нажмите "Проверить вход" через пару секунд.');
+            }
         }
 
         async function pollQrStatus() {
@@ -394,7 +398,12 @@
             }
 
             if (data.status === 'pending') {
-                setQrStatus('Ожидание сканирования и подтверждения в Telegram...');
+                if (data.qr_url) {
+                    showQrImage(data.qr_url);
+                    setQrStatus('QR-код готов. Сканируйте и подтвердите вход в Telegram.');
+                } else {
+                    setQrStatus('Ожидание генерации QR и подтверждения входа...');
+                }
                 return;
             }
 
