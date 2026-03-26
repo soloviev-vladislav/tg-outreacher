@@ -3,17 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Вход | Telegram Outreach</title>
+    <title>Вход через Telegram</title>
     <style>
         :root {
             --bg: #f3f5f8;
             --card: #ffffff;
             --text: #1a1f2b;
             --muted: #6c7484;
-            --accent: #2f6fed;
-            --accent-hover: #245ac2;
             --border: #d8deea;
             --danger: #c0392b;
+            --ok: #1f8b4c;
         }
         * { box-sizing: border-box; }
         body {
@@ -28,7 +27,7 @@
         }
         .card {
             width: 100%;
-            max-width: 420px;
+            max-width: 460px;
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 14px;
@@ -40,104 +39,147 @@
             font-size: 24px;
         }
         p {
-            margin: 0 0 20px;
+            margin: 0 0 16px;
             color: var(--muted);
             font-size: 14px;
+            line-height: 1.4;
         }
-        label {
-            display: block;
-            margin-bottom: 6px;
+        .widget-wrap {
+            display: flex;
+            justify-content: center;
+            min-height: 44px;
+            margin-top: 6px;
+        }
+        .message {
+            margin-top: 14px;
             font-size: 13px;
-            color: #33405d;
-        }
-        input {
-            width: 100%;
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 10px 12px;
-            font-size: 14px;
-            margin-bottom: 14px;
-            outline: none;
-        }
-        input:focus {
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.12);
-        }
-        button {
-            width: 100%;
-            border: 0;
-            border-radius: 10px;
-            padding: 11px 14px;
-            font-size: 14px;
-            font-weight: 600;
-            color: #fff;
-            background: var(--accent);
-            cursor: pointer;
-        }
-        button:hover { background: var(--accent-hover); }
-        .error {
-            margin-top: 12px;
-            font-size: 13px;
-            color: var(--danger);
             min-height: 18px;
         }
+        .err { color: var(--danger); }
+        .ok { color: var(--ok); }
         .links {
             margin-top: 14px;
             font-size: 13px;
             color: var(--muted);
         }
         .links a {
-            color: var(--accent);
+            color: #2f6fed;
             text-decoration: none;
+        }
+        .payment-wrap {
+            margin-top: 12px;
+            display: none;
+            text-align: center;
+        }
+        .pay-link {
+            display: inline-block;
+            background: #2f6fed;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 14px;
+            font-weight: 600;
         }
     </style>
 </head>
 <body>
     <div class="card">
         <h1>Вход</h1>
-        <p>Введите логин и пароль пользователя.</p>
-        <form id="login-form">
-            <label for="username">Логин</label>
-            <input id="username" name="username" autocomplete="username" required />
+        <p>Авторизация в приложении доступна только через Telegram Login Widget.</p>
 
-            <label for="password">Пароль</label>
-            <input id="password" name="password" type="password" autocomplete="current-password" required />
+        <div id="widgetWrap" class="widget-wrap"></div>
+        <div id="message" class="message {% if auth_error %}err{% elif auth_message %}ok{% endif %}">
+            {% if auth_error %}
+                {{ auth_error }}
+            {% elif auth_message %}
+                {{ auth_message }}
+            {% endif %}
+        </div>
+        <div id="paymentWrap" class="payment-wrap">
+            <a id="payLink" class="pay-link" href="#" target="_blank" rel="noopener">Оплатить подписку</a>
+        </div>
 
-            <button type="submit">Войти</button>
-            <div id="error" class="error"></div>
-        </form>
         <div class="links">
-            Нет аккаунта: <a href="/register">зарегистрироваться</a>
+            Нет аккаунта: <a href="/register">зарегистрироваться через Telegram</a>
+            <br>
+            <a href="/oferta" target="_blank" rel="noopener" style="font-size:12px; color:#64748b;">Оферта</a>
         </div>
     </div>
 
     <script>
-        const form = document.getElementById('login-form');
-        const errorEl = document.getElementById('error');
+        const botUsername = {{ (telegram_bot_username or '')|tojson }};
+        const messageEl = document.getElementById('message');
+        const widgetWrap = document.getElementById('widgetWrap');
+        const paymentWrap = document.getElementById('paymentWrap');
+        const payLink = document.getElementById('payLink');
 
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            errorEl.textContent = '';
+        function setMessage(text, isError) {
+            messageEl.textContent = text || '';
+            messageEl.classList.remove('err', 'ok');
+            if (!text) return;
+            messageEl.classList.add(isError ? 'err' : 'ok');
+        }
+        function setPaymentUrl(url) {
+            const value = String(url || '').trim();
+            if (!value) {
+                paymentWrap.style.display = 'none';
+                payLink.setAttribute('href', '#');
+                return;
+            }
+            payLink.setAttribute('href', value);
+            paymentWrap.style.display = 'block';
+        }
 
-            const username = document.getElementById('username').value.trim();
-            const password = document.getElementById('password').value;
-
+        async function onTelegramAuth(user) {
             try {
-                const response = await fetch('/api/auth/login', {
+                setMessage('Проверяем Telegram авторизацию...', false);
+                setPaymentUrl('');
+                const response = await fetch('/api/auth/telegram/widget', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
+                    body: JSON.stringify({ mode: 'login', auth: user })
                 });
                 const payload = await response.json().catch(() => ({}));
-                if (!response.ok) {
-                    errorEl.textContent = payload.error || 'Ошибка входа';
+                if (!response.ok && payload.status !== 'payment_required') {
+                    setMessage(payload.error || 'Ошибка входа через Telegram', true);
                     return;
                 }
-                window.location.href = '/';
+                if (payload.status === 'ok') {
+                    window.location.href = payload.next || '/';
+                    return;
+                }
+                if (payload.status === 'pending') {
+                    setMessage(payload.message || 'Ожидайте активацию админом', false);
+                    return;
+                }
+                if (payload.status === 'payment_required') {
+                    const stars = Number(payload.stars_price || 0);
+                    const starsText = stars > 0 ? ` (${stars} Stars/мес)` : '';
+                    setMessage((payload.message || 'Требуется оплата подписки') + starsText, true);
+                    setPaymentUrl(payload.payment_url || '');
+                    return;
+                }
+                setMessage(payload.error || payload.message || 'Ошибка входа через Telegram', true);
             } catch (err) {
-                errorEl.textContent = 'Сервер недоступен';
+                setMessage('Сервер недоступен', true);
             }
-        });
+        }
+
+        window.onTelegramAuth = onTelegramAuth;
+
+        if (!botUsername) {
+            setMessage('Telegram Login не настроен: не задан bot username', true);
+        } else {
+            const script = document.createElement('script');
+            script.async = true;
+            script.src = 'https://telegram.org/js/telegram-widget.js?23';
+            script.setAttribute('data-telegram-login', botUsername);
+            script.setAttribute('data-size', 'large');
+            script.setAttribute('data-onauth', 'onTelegramAuth(user)');
+            script.setAttribute('data-request-access', 'write');
+            widgetWrap.appendChild(script);
+        }
     </script>
 </body>
 </html>

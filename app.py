@@ -8,19 +8,38 @@ import sqlite3
 import io
 import subprocess
 import re
-from datetime import datetime, date
+import base64
+import hashlib
+import hmac
+import secrets
+import shutil
+import tempfile
+from collections import deque
+from datetime import datetime, date, timedelta, timezone
+from urllib.parse import urlencode
 from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash, generate_password_hash
 import pandas as pd
 import requests
 from telethon import TelegramClient, errors
-from telegram_bot import TelegramAccountManager, Database, OutreachManager
+from telethon.tl.functions.contacts import ImportContactsRequest
+from telethon.tl.functions.channels import JoinChannelRequest, InviteToChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import InputUser, InputPeerUser, PeerUser, InputPhoneContact
+from telegram_bot import TelegramAccountManager, Database, OutreachManager, build_telethon_proxy_config
 import logging
 import time
 import sys
 import atexit
 import csv
 import uuid
+
+try:
+    import jwt
+    from jwt import PyJWKClient
+except Exception:
+    jwt = None
+    PyJWKClient = None
 
 try:
     import fcntl
@@ -33,8 +52,12 @@ try:
     import eventlet.patcher as _eventlet_patcher
     _native_threading = _eventlet_patcher.original('threading')
     NativeThread = _native_threading.Thread
+    NativeLock = _native_threading.Lock
+    NativeEvent = _native_threading.Event
 except Exception:
     NativeThread = threading.Thread
+    NativeLock = threading.Lock
+    NativeEvent = threading.Event
 
 def load_local_env(path='.env'):
     if not os.path.exists(path):
@@ -116,9 +139,42 @@ def acquire_single_process_lock():
 db = Database()
 outreach = OutreachManager()
 
-# Фиксируем постоянный чат визиток для рассылок (можно переопределить через UI/API).
-if not db.get_config('outreach_target_chat'):
-    db.set_config('outreach_target_chat', 'aihubco')
+GLOBAL_TARGET_CHAT_INVITE = "https://t.me/voronkastore"
+BILLING_TRIAL_DAYS = max(1, int(os.getenv('BILLING_TRIAL_DAYS', '7') or '7'))
+BILLING_PLAN_DAYS = max(1, int(os.getenv('BILLING_PLAN_DAYS', '30') or '30'))
+# Примерная конвертация тарифа 1890 RUB в Telegram Stars.
+BILLING_MONTHLY_STARS = max(1, int(os.getenv('BILLING_MONTHLY_STARS', '1050') or '1050'))
+BILLING_BOT_POLLING_ENABLED = os.getenv('BILLING_BOT_POLLING_ENABLED', '1') == '1'
+SUBSCRIPTION_PAYLOAD_PREFIX = 'voronka_sub_v1'
+
+def normalize_chat_ref(chat_ref: str) -> str:
+    if not chat_ref:
+        return chat_ref
+    value = str(chat_ref).strip()
+    if not value:
+        return value
+    # drop scheme + domain
+    for prefix in (
+        "https://t.me/",
+        "http://t.me/",
+        "https://telegram.me/",
+        "http://telegram.me/",
+        "t.me/",
+        "telegram.me/",
+    ):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = value.strip()
+    if value.startswith("@"):
+        value = value[1:]
+    # drop query params / fragments and trailing slash
+    value = value.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+    return value
+
+# Фиксируем постоянный чат для проверки/прогрева user_id.
+if db.get_config('outreach_target_chat') != GLOBAL_TARGET_CHAT_INVITE:
+    db.set_config('outreach_target_chat', GLOBAL_TARGET_CHAT_INVITE)
 
 def ensure_db_schema():
     with sqlite3.connect(db.db_path) as conn:
@@ -143,6 +199,26 @@ def ensure_db_schema():
                 FOREIGN KEY(tenant_id) REFERENCES tenants(id)
             )
         ''')
+        cursor.execute("PRAGMA table_info(users)")
+        user_columns = [col[1] for col in cursor.fetchall()]
+        if 'telegram_id' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN telegram_id TEXT')
+        if 'telegram_username' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN telegram_username TEXT')
+        if 'telegram_name' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN telegram_name TEXT')
+        if 'telegram_phone' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN telegram_phone TEXT')
+        if 'telegram_photo_url' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN telegram_photo_url TEXT')
+        if 'telegram_auth_at' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN telegram_auth_at TIMESTAMP')
+        if 'trial_started_at' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN trial_started_at TIMESTAMP')
+        if 'trial_ends_at' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN trial_ends_at TIMESTAMP')
+        if 'subscription_expires_at' not in user_columns:
+            cursor.execute('ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tenant_config (
                 tenant_id INTEGER NOT NULL,
@@ -170,22 +246,36 @@ def ensure_db_schema():
             cursor.execute('ALTER TABLE outreach_contacts ADD COLUMN access_hash TEXT')
         if 'tenant_id' not in contact_columns:
             cursor.execute('ALTER TABLE outreach_contacts ADD COLUMN tenant_id INTEGER DEFAULT 1')
+        cursor.execute("PRAGMA table_info(outreach_messages)")
+        msg_columns = [col[1] for col in cursor.fetchall()]
+        if 'tenant_id' not in msg_columns:
+            cursor.execute('ALTER TABLE outreach_messages ADD COLUMN tenant_id INTEGER DEFAULT 1')
         cursor.execute("PRAGMA table_info(conversations)")
         conv_columns = [col[1] for col in cursor.fetchall()]
         if 'tenant_id' not in conv_columns:
             cursor.execute('ALTER TABLE conversations ADD COLUMN tenant_id INTEGER DEFAULT 1')
+        if 'is_unread' not in conv_columns:
+            cursor.execute('ALTER TABLE conversations ADD COLUMN is_unread INTEGER DEFAULT 0')
         cursor.execute("PRAGMA table_info(account_stats)")
         account_columns = [col[1] for col in cursor.fetchall()]
         if 'outreach_daily_limit' not in account_columns:
             cursor.execute('ALTER TABLE account_stats ADD COLUMN outreach_daily_limit INTEGER DEFAULT 20')
+        if 'checker_daily_limit' not in account_columns:
+            cursor.execute('ALTER TABLE account_stats ADD COLUMN checker_daily_limit INTEGER DEFAULT 20')
         if 'tenant_id' not in account_columns:
             cursor.execute('ALTER TABLE account_stats ADD COLUMN tenant_id INTEGER DEFAULT 1')
         if 'added_by_user_id' not in account_columns:
             cursor.execute('ALTER TABLE account_stats ADD COLUMN added_by_user_id INTEGER')
+        if 'first_name' not in account_columns:
+            cursor.execute('ALTER TABLE account_stats ADD COLUMN first_name TEXT')
+        if 'last_name' not in account_columns:
+            cursor.execute('ALTER TABLE account_stats ADD COLUMN last_name TEXT')
         cursor.execute("PRAGMA table_info(proxies)")
         proxy_columns = [col[1] for col in cursor.fetchall()]
         if 'tenant_id' not in proxy_columns:
             cursor.execute('ALTER TABLE proxies ADD COLUMN tenant_id INTEGER DEFAULT 1')
+        if 'added_by_user_id' not in proxy_columns:
+            cursor.execute('ALTER TABLE proxies ADD COLUMN added_by_user_id INTEGER')
         cursor.execute("PRAGMA table_info(account_fingerprints)")
         fp_columns = [col[1] for col in cursor.fetchall()]
         if 'tenant_id' not in fp_columns:
@@ -289,6 +379,23 @@ def ensure_db_schema():
                 locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS billing_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                telegram_user_id TEXT,
+                invoice_payload TEXT,
+                telegram_payment_charge_id TEXT,
+                provider_payment_charge_id TEXT,
+                amount_stars INTEGER DEFAULT 0,
+                currency TEXT DEFAULT 'XTR',
+                paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                raw_update_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        ''')
         cursor.execute("SELECT id FROM tenants WHERE is_default = 1 LIMIT 1")
         row = cursor.fetchone()
         if row:
@@ -300,7 +407,8 @@ def ensure_db_schema():
         for table in (
             'outreach_campaigns', 'outreach_contacts', 'conversations', 'account_stats',
             'proxies', 'account_fingerprints', 'form_data', 'check_history',
-            'outreach_templates', 'outreach_blacklist', 'scheduler_campaign_locks'
+            'outreach_templates', 'outreach_blacklist', 'scheduler_campaign_locks',
+            'outreach_messages'
             , 'outreach_bases', 'outreach_base_contacts', 'dorks_runs', 'dorks_run_queries'
         ):
             try:
@@ -314,14 +422,18 @@ def ensure_db_schema():
             admin_username = str(os.getenv('DEFAULT_ADMIN_USERNAME', 'admin')).strip() or 'admin'
             admin_password = str(os.getenv('DEFAULT_ADMIN_PASSWORD', os.getenv('APP_PASSWORD', 'admin'))).strip() or 'admin'
             cursor.execute('''
-                INSERT INTO users (tenant_id, username, password_hash, role, is_active)
-                VALUES (?, ?, ?, 'admin', 1)
-            ''', (default_tenant_id, admin_username, generate_password_hash(admin_password)))
+                INSERT INTO users (
+                    tenant_id, username, password_hash, role, is_active,
+                    trial_started_at, trial_ends_at
+                )
+                VALUES (?, ?, ?, 'admin', 1, CURRENT_TIMESTAMP, datetime(CURRENT_TIMESTAMP, ?))
+            ''', (default_tenant_id, admin_username, generate_password_hash(admin_password), f'+{BILLING_TRIAL_DAYS} day'))
             logger.warning("Created default admin user for multi-user mode: username='%s'", admin_username)
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_contacts_campaign_status ON outreach_contacts(campaign_id, status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_contact_direction_sent_at ON conversations(contact_id, direction, sent_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_campaign_direction_sent_at ON conversations(campaign_id, direction, sent_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_tenant_contact_msg ON conversations(tenant_id, contact_id, message_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_campaigns_tenant ON outreach_campaigns(tenant_id, status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_contacts_tenant ON outreach_contacts(tenant_id, campaign_id, status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id, campaign_id)')
@@ -332,15 +444,83 @@ def ensure_db_schema():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_templates_tenant ON outreach_templates(tenant_id, name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_bases_tenant ON outreach_bases(tenant_id, created_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_base_contacts_tenant ON outreach_base_contacts(tenant_id, base_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_outreach_messages_tenant_contact ON outreach_messages(tenant_id, contact_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dorks_runs_tenant ON dorks_runs(tenant_id, created_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dorks_run_queries_run ON dorks_run_queries(tenant_id, run_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_stats_added_by ON account_stats(tenant_id, added_by_user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_campaigns_created_by ON outreach_campaigns(tenant_id, created_by_user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_proxies_added_by ON proxies(tenant_id, added_by_user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_billing_payments_user ON billing_payments(tenant_id, user_id, paid_at)')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_charge_unique ON billing_payments(telegram_payment_charge_id)')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id_unique ON users(telegram_id) WHERE telegram_id IS NOT NULL')
         cursor.execute("UPDATE users SET role = 'user' WHERE role = 'viewer'")
         cursor.execute("UPDATE users SET role = 'admin' WHERE role = 'owner'")
+        cursor.execute('''
+            UPDATE users
+            SET trial_started_at = COALESCE(trial_started_at, CURRENT_TIMESTAMP)
+            WHERE trial_started_at IS NULL
+        ''')
+        cursor.execute(
+            f'''
+            UPDATE users
+            SET trial_ends_at = datetime(trial_started_at, '+{BILLING_TRIAL_DAYS} day')
+            WHERE trial_ends_at IS NULL
+            '''
+        )
+        # Заполняем владельца прокси для старых записей.
+        cursor.execute('''
+            UPDATE proxies
+            SET added_by_user_id = (
+                SELECT a.added_by_user_id
+                FROM account_stats a
+                WHERE a.tenant_id = proxies.tenant_id
+                  AND a.proxy_id = proxies.id
+                  AND a.added_by_user_id IS NOT NULL
+                GROUP BY a.added_by_user_id
+                ORDER BY COUNT(*) DESC
+                LIMIT 1
+            )
+            WHERE added_by_user_id IS NULL
+        ''')
+        cursor.execute('''
+            UPDATE proxies
+            SET added_by_user_id = (
+                SELECT u.id
+                FROM users u
+                WHERE u.tenant_id = proxies.tenant_id
+                  AND lower(u.role) IN ('admin', 'owner')
+                ORDER BY u.id
+                LIMIT 1
+            )
+            WHERE added_by_user_id IS NULL
+        ''')
         conn.commit()
 
 ensure_db_schema()
+
+try:
+    with sqlite3.connect(db.db_path) as _conn:
+        _cur = _conn.cursor()
+        _cur.execute(
+            '''
+            INSERT INTO config (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            ''',
+            ('outreach_target_chat', GLOBAL_TARGET_CHAT_INVITE)
+        )
+        _cur.execute('SELECT id FROM tenants')
+        for _row in _cur.fetchall():
+            _tenant_id = int(_row[0])
+            _cur.execute(
+                '''
+                INSERT INTO tenant_config (tenant_id, key, value) VALUES (?, ?, ?)
+                ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value
+                ''',
+                (_tenant_id, 'outreach_target_chat', GLOBAL_TARGET_CHAT_INVITE)
+            )
+        _conn.commit()
+except Exception as _cfg_err:
+    logger.warning(f"Could not enforce global outreach_target_chat: {_cfg_err}")
 
 # Импортируем новые менеджеры
 from proxy_manager import ProxyManager
@@ -352,14 +532,25 @@ fingerprint_manager = FingerprintManager()
 DEFAULT_API_ID = os.getenv('TELEGRAM_API_ID', '').strip()
 DEFAULT_API_HASH = os.getenv('TELEGRAM_API_HASH', '').strip()
 APP_PASSWORD = os.getenv('APP_PASSWORD', '').strip()
+TELEGRAM_LOGIN_CLIENT_ID = os.getenv('TELEGRAM_LOGIN_CLIENT_ID', '').strip()
+TELEGRAM_LOGIN_CLIENT_SECRET = os.getenv('TELEGRAM_LOGIN_CLIENT_SECRET', '').strip()
+TELEGRAM_LOGIN_REDIRECT_URI = os.getenv('TELEGRAM_LOGIN_REDIRECT_URI', '').strip()
+TELEGRAM_LOGIN_SCOPE = os.getenv('TELEGRAM_LOGIN_SCOPE', 'openid profile phone').strip() or 'openid profile phone'
+TELEGRAM_LOGIN_BOT_USERNAME = os.getenv('TELEGRAM_LOGIN_BOT_USERNAME', '').strip().lstrip('@')
+TELEGRAM_LOGIN_BOT_TOKEN = os.getenv('TELEGRAM_LOGIN_BOT_TOKEN', '').strip()
+TELEGRAM_OIDC_DISCOVERY = 'https://oauth.telegram.org/.well-known/openid-configuration'
 AUTH_EXEMPT_PATHS = {
     '/health',
     '/login',
     '/register',
+    '/oferta',
     '/logout',
     '/api/auth/login',
     '/api/auth/me',
-    '/api/auth/register'
+    '/api/auth/register',
+    '/api/auth/telegram/start',
+    '/api/auth/telegram/widget',
+    '/auth/telegram/callback'
 }
 
 if DEFAULT_API_ID and DEFAULT_API_HASH:
@@ -379,7 +570,7 @@ def run_async(coro):
 
     if running_loop and running_loop.is_running():
         result_holder = {'result': None, 'error': None}
-        done = threading.Event()
+        done = NativeEvent()
 
         def _runner():
             loop = asyncio.new_event_loop()
@@ -395,7 +586,7 @@ def run_async(coro):
                     pass
                 done.set()
 
-        threading.Thread(target=_runner, daemon=True).start()
+        NativeThread(target=_runner, daemon=True).start()
         done.wait()
         if result_holder['error']:
             raise result_holder['error']
@@ -406,7 +597,7 @@ def run_async(coro):
 def run_async_threadsafe(coro):
     """Всегда выполняет coroutine в отдельном потоке со своим event loop."""
     result_holder = {'result': None, 'error': None}
-    done = threading.Event()
+    done = NativeEvent()
 
     def _runner():
         loop = asyncio.new_event_loop()
@@ -422,7 +613,7 @@ def run_async_threadsafe(coro):
                 pass
             done.set()
 
-    threading.Thread(target=_runner, daemon=True).start()
+    NativeThread(target=_runner, daemon=True).start()
     done.wait()
     if result_holder['error']:
         raise result_holder['error']
@@ -434,6 +625,176 @@ def get_api_credentials(payload=None):
     api_id = str(payload.get('api_id') or db.get_config('api_id', tenant_id=tenant_id) or DEFAULT_API_ID).strip()
     api_hash = str(payload.get('api_hash') or db.get_config('api_hash', tenant_id=tenant_id) or DEFAULT_API_HASH).strip()
     return api_id, api_hash
+
+def _normalize_phone_value(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return None
+    digits = ''.join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    if len(digits) == 11 and digits.startswith('8'):
+        digits = '7' + digits[1:]
+    if len(digits) == 10:
+        digits = '7' + digits
+    return f"+{digits}"
+
+def _parse_checker_file(filepath: str):
+    phones = []
+    phone_metadata = {}
+    parsed_rows = 0
+    detected_columns = {
+        'phone': None,
+        'name': None,
+        'company': None,
+        'position': None
+    }
+
+    if filepath.lower().endswith('.txt'):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                norm = _normalize_phone_value(line.strip())
+                if norm:
+                    phones.append(norm)
+        # сохраняем порядок, убираем дубли
+        phones = list(dict.fromkeys(phones))
+        return phones, phone_metadata, parsed_rows, detected_columns
+
+    if filepath.lower().endswith('.csv'):
+        df = pd.read_csv(filepath)
+    else:
+        df = pd.read_excel(filepath)
+    parsed_rows = int(len(df.index))
+    df.columns = [str(c).strip() for c in df.columns]
+    low_cols = {str(c).lower().strip(): str(c).strip() for c in df.columns}
+
+    phone_col = next((orig for low, orig in low_cols.items() if 'phone' in low or 'tel' in low or 'номер' in low), None)
+    # Важно: не путать `name` и `username`.
+    preferred_name_keys = ['name', 'full_name', 'contact_name', 'имя', 'фио']
+    name_col = next((low_cols.get(k) for k in preferred_name_keys if k in low_cols), None)
+    if not name_col:
+        name_col = next(
+            (
+                orig for low, orig in low_cols.items()
+                if ('name' in low or 'имя' in low)
+                and low not in ('username', 'telegram_username', 'tg_username', 'user_name')
+                and 'username' not in low
+            ),
+            None
+        )
+    company_col = next((orig for low, orig in low_cols.items() if 'company' in low or 'компан' in low), None)
+    position_col = next((orig for low, orig in low_cols.items() if 'position' in low or 'должн' in low or 'role' in low), None)
+
+    detected_columns['phone'] = phone_col
+    detected_columns['name'] = name_col
+    detected_columns['company'] = company_col
+    detected_columns['position'] = position_col
+
+    if not phone_col:
+        raise ValueError("Не найдена колонка с телефоном (phone/tel/номер)")
+
+    for _, row in df.iterrows():
+        phone = _normalize_phone_value(row.get(phone_col))
+        if not phone:
+            continue
+        if phone not in phone_metadata:
+            phones.append(phone)
+            phone_metadata[phone] = {}
+        if name_col:
+            val = row.get(name_col)
+            if pd.notna(val):
+                phone_metadata[phone]['name'] = str(val).strip()
+        if company_col:
+            val = row.get(company_col)
+            if pd.notna(val):
+                phone_metadata[phone]['company'] = str(val).strip()
+        if position_col:
+            val = row.get(position_col)
+            if pd.notna(val):
+                phone_metadata[phone]['position'] = str(val).strip()
+
+    return phones, phone_metadata, parsed_rows, detected_columns
+
+async def ensure_outreach_accounts_in_global_target_chat(tenant_id: int, account_phones=None):
+    api_id = str(db.get_config('api_id', tenant_id=tenant_id) or DEFAULT_API_ID).strip()
+    api_hash = str(db.get_config('api_hash', tenant_id=tenant_id) or DEFAULT_API_HASH).strip()
+    if not api_id or not api_hash:
+        return {'success': 0, 'already': 0, 'failed': 0, 'total': 0}
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        if account_phones:
+            normalized = [str(p).strip() for p in account_phones if str(p).strip()]
+            if not normalized:
+                return {'success': 0, 'already': 0, 'failed': 0, 'total': 0}
+            placeholders = ",".join("?" for _ in normalized)
+            cursor.execute(
+                f'''
+                SELECT phone, session_name
+                FROM account_stats
+                WHERE tenant_id = ?
+                  AND account_type = 'outreach'
+                  AND COALESCE(is_banned, 0) = 0
+                  AND COALESCE(is_frozen, 0) = 0
+                  AND phone IN ({placeholders})
+                ''',
+                [tenant_id, *normalized]
+            )
+        else:
+            cursor.execute('''
+                SELECT phone, session_name
+                FROM account_stats
+                WHERE tenant_id = ?
+                  AND account_type = 'outreach'
+                  AND COALESCE(is_banned, 0) = 0
+                  AND COALESCE(is_frozen, 0) = 0
+            ''', (tenant_id,))
+        rows = cursor.fetchall()
+
+    results = {'success': 0, 'already': 0, 'failed': 0, 'total': len(rows)}
+    if not rows:
+        return results
+
+    chat_ref = normalize_chat_ref(GLOBAL_TARGET_CHAT_INVITE)
+    for phone, session_name in rows:
+        session_path = os.path.join('sessions', str(session_name or ''))
+        if not session_name or not os.path.exists(session_path + '.session'):
+            results['failed'] += 1
+            continue
+        client = TelegramClient(session_path, api_id=int(api_id), api_hash=api_hash)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                results['failed'] += 1
+                continue
+            try:
+                if '+' in chat_ref or 'joinchat' in chat_ref:
+                    hash_part = chat_ref.split('/')[-1].replace('+', '')
+                    if 'joinchat/' in hash_part:
+                        hash_part = hash_part.split('joinchat/')[-1]
+                    await client(ImportChatInviteRequest(hash_part))
+                    results['success'] += 1
+                else:
+                    entity = await client.get_entity(chat_ref)
+                    await client(JoinChannelRequest(entity))
+                    results['success'] += 1
+            except errors.UserAlreadyParticipantError:
+                results['already'] += 1
+            except Exception as e:
+                if 'USER_ALREADY_PARTICIPANT' in str(e):
+                    results['already'] += 1
+                else:
+                    logger.warning(f"[{phone}] failed to join global target chat: {e}")
+                    results['failed'] += 1
+        except Exception as e:
+            logger.warning(f"[{phone}] connect failed during global chat ensure: {e}")
+            results['failed'] += 1
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+    return results
 
 def filter_valid_outreach_accounts(selected_accounts):
     selected = [str(a).strip() for a in (selected_accounts or []) if str(a).strip()]
@@ -476,6 +837,91 @@ def filter_valid_outreach_accounts(selected_accounts):
     # сохраняем порядок выбора в UI
     return [phone for phone in selected if phone in allowed]
 
+def _count_followup_steps(strategy: dict) -> int:
+    steps = (strategy or {}).get('steps') or []
+    count = 0
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        content = str(step.get('content') or '').strip()
+        sid = None
+        try:
+            sid = int(step.get('id'))
+        except (TypeError, ValueError):
+            sid = None
+        if content and sid and sid > 1:
+            count += 1
+    return count
+
+def _normalize_campaign_schedule(schedule: dict, followup_steps_count: int) -> dict:
+    raw = schedule if isinstance(schedule, dict) else {}
+    start_time = str(raw.get('start_time') or '10:00').strip()
+    end_time = str(raw.get('end_time') or '20:00').strip()
+    days_raw = raw.get('days') or [1, 2, 3, 4, 5]
+    days = []
+    for d in days_raw:
+        try:
+            dv = int(d)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= dv <= 6 and dv not in days:
+            days.append(dv)
+    if not days:
+        days = [1, 2, 3, 4, 5]
+    try:
+        ignore_after_hours = max(1, int(raw.get('ignore_after_hours') or 24))
+    except (TypeError, ValueError):
+        ignore_after_hours = 24
+    if followup_steps_count > 0:
+        ignore_after_hours = max(25, ignore_after_hours)
+    return {
+        'start_time': start_time,
+        'end_time': end_time,
+        'ignore_after_hours': ignore_after_hours,
+        'days': days
+    }
+
+def _calculate_campaign_capacity(tenant_id: int, accounts: list, strategy: dict) -> dict:
+    selected_accounts = [str(a).strip() for a in (accounts or []) if str(a).strip()]
+    followup_steps = _count_followup_steps(strategy or {})
+    waves_required = max(1, followup_steps + 1)
+    total_accounts = len(selected_accounts)
+
+    limits = []
+    if selected_accounts:
+        placeholders = ",".join("?" for _ in selected_accounts)
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'''
+                SELECT phone, COALESCE(outreach_daily_limit, 20)
+                FROM account_stats
+                WHERE tenant_id = ?
+                  AND phone IN ({placeholders})
+                ''',
+                [tenant_id, *selected_accounts]
+            )
+            rows = cursor.fetchall()
+        limit_by_phone = {str(r[0]): max(1, int(r[1] or 20)) for r in rows}
+        limits = [limit_by_phone.get(phone, 20) for phone in selected_accounts]
+
+    primary_accounts_per_day = total_accounts // waves_required if waves_required > 0 else 0
+    per_account_limit_floor = min(limits) if limits else 20
+    safe_new_per_day = primary_accounts_per_day * per_account_limit_floor
+    shortage_for_rotation = max(0, waves_required - total_accounts)
+    accounts_to_add_for_next_step = max(0, waves_required * (primary_accounts_per_day + 1) - total_accounts)
+
+    return {
+        'followup_steps': followup_steps,
+        'waves_required': waves_required,
+        'accounts_total': total_accounts,
+        'primary_accounts_per_day': primary_accounts_per_day,
+        'per_account_limit_floor': per_account_limit_floor,
+        'safe_new_per_day': safe_new_per_day,
+        'shortage_for_rotation': shortage_for_rotation,
+        'accounts_to_add_for_next_step': accounts_to_add_for_next_step
+    }
+
 def _is_auth_exempt_path(path: str) -> bool:
     if path.startswith('/static/'):
         return True
@@ -512,7 +958,16 @@ def get_current_user():
     with sqlite3.connect(db.db_path) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT id, tenant_id, username, role, is_active
+            SELECT
+                id,
+                tenant_id,
+                username,
+                role,
+                is_active,
+                telegram_id,
+                trial_started_at,
+                trial_ends_at,
+                subscription_expires_at
             FROM users
             WHERE id = ?
         ''', (uid,))
@@ -529,7 +984,11 @@ def get_current_user():
         'tenant_id': int(row[1]),
         'username': row[2],
         'role': role,
-        'is_active': bool(row[4])
+        'is_active': bool(row[4]),
+        'telegram_id': str(row[5] or ''),
+        'trial_started_at': row[6],
+        'trial_ends_at': row[7],
+        'subscription_expires_at': row[8]
     }
 
 def is_admin_user(user=None) -> bool:
@@ -590,6 +1049,612 @@ def require_role(*allowed_roles):
         return user, (jsonify({'error': 'Forbidden'}), 403)
     return user, None
 
+_telegram_discovery_cache = {'at': 0.0, 'data': None}
+_telegram_jwks_client = None
+_telegram_jwks_uri = ''
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode('utf-8').rstrip('=')
+
+def _telegram_login_credentials(tenant_id: int) -> tuple[str, str]:
+    client_id = str(
+        db.get_config('telegram_login_client_id', tenant_id=tenant_id)
+        or db.get_config('telegram_client_id', tenant_id=tenant_id)
+        or TELEGRAM_LOGIN_CLIENT_ID
+    ).strip()
+    client_secret = str(
+        db.get_config('telegram_login_client_secret', tenant_id=tenant_id)
+        or db.get_config('telegram_client_secret', tenant_id=tenant_id)
+        or TELEGRAM_LOGIN_CLIENT_SECRET
+    ).strip()
+    return client_id, client_secret
+
+def _telegram_widget_credentials(tenant_id: int) -> tuple[str, str]:
+    bot_username = str(
+        db.get_config('telegram_login_bot_username', tenant_id=tenant_id)
+        or db.get_config('telegram_bot_username', tenant_id=tenant_id)
+        or TELEGRAM_LOGIN_BOT_USERNAME
+    ).strip().lstrip('@')
+    bot_token = str(
+        db.get_config('telegram_login_bot_token', tenant_id=tenant_id)
+        or db.get_config('telegram_bot_token', tenant_id=tenant_id)
+        or TELEGRAM_LOGIN_BOT_TOKEN
+    ).strip()
+    return bot_username, bot_token
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def _parse_db_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        raw = raw.replace('Z', '+00:00')
+        dt = None
+        for candidate in (raw, raw.replace(' ', 'T')):
+            try:
+                dt = datetime.fromisoformat(candidate)
+                break
+            except Exception:
+                dt = None
+        if dt is None:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+def _format_db_datetime(value: datetime) -> str:
+    return value.strftime('%Y-%m-%d %H:%M:%S')
+
+def _build_subscription_payload(tenant_id: int, user_id: int) -> str:
+    nonce = secrets.token_hex(6)
+    return f"{SUBSCRIPTION_PAYLOAD_PREFIX}:{int(tenant_id)}:{int(user_id)}:{int(time.time())}:{nonce}"
+
+def _parse_subscription_payload(payload: str):
+    raw = str(payload or '').strip()
+    parts = raw.split(':')
+    if len(parts) < 4:
+        return None
+    if parts[0] != SUBSCRIPTION_PAYLOAD_PREFIX:
+        return None
+    try:
+        tenant_id = int(parts[1])
+        user_id = int(parts[2])
+        issued_at = int(parts[3])
+    except Exception:
+        return None
+    return {
+        'tenant_id': tenant_id,
+        'user_id': user_id,
+        'issued_at': issued_at,
+        'raw': raw
+    }
+
+def _billing_state(trial_ends_at, subscription_expires_at, now=None) -> dict:
+    ts_now = now or _utcnow_naive()
+    trial_end_dt = _parse_db_datetime(trial_ends_at)
+    sub_end_dt = _parse_db_datetime(subscription_expires_at)
+
+    if sub_end_dt and sub_end_dt > ts_now:
+        return {
+            'active': True,
+            'mode': 'subscription',
+            'active_until': sub_end_dt,
+            'message': f"Подписка активна до {sub_end_dt.strftime('%d.%m.%Y %H:%M')}"
+        }
+    if trial_end_dt and trial_end_dt > ts_now:
+        return {
+            'active': True,
+            'mode': 'trial',
+            'active_until': trial_end_dt,
+            'message': f"Триал активен до {trial_end_dt.strftime('%d.%m.%Y %H:%M')}"
+        }
+    return {
+        'active': False,
+        'mode': 'expired',
+        'active_until': sub_end_dt or trial_end_dt,
+        'message': 'Триал закончился. Для входа оплатите подписку.'
+    }
+
+def _ensure_user_trial_window(cursor, user_id: int):
+    cursor.execute(
+        '''
+        UPDATE users
+        SET trial_started_at = COALESCE(trial_started_at, CURRENT_TIMESTAMP)
+        WHERE id = ? AND trial_started_at IS NULL
+        ''',
+        (int(user_id),)
+    )
+    cursor.execute(
+        f'''
+        UPDATE users
+        SET trial_ends_at = datetime(trial_started_at, '+{BILLING_TRIAL_DAYS} day')
+        WHERE id = ? AND trial_ends_at IS NULL
+        ''',
+        (int(user_id),)
+    )
+
+def _telegram_bot_api_request(bot_token: str, method: str, payload: dict = None, timeout: int = 35):
+    token = str(bot_token or '').strip()
+    if not token:
+        raise RuntimeError('Telegram bot token is not configured')
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    response = requests.post(url, json=payload or {}, timeout=timeout)
+    response.raise_for_status()
+    data = response.json() or {}
+    if not data.get('ok'):
+        raise RuntimeError(str(data.get('description') or f'{method} failed'))
+    return data.get('result')
+
+def _create_subscription_invoice_link(user_id: int, tenant_id: int) -> str:
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, tenant_id, telegram_id
+            FROM users
+            WHERE id = ? AND tenant_id = ?
+            LIMIT 1
+            ''',
+            (int(user_id), int(tenant_id))
+        )
+        row = cursor.fetchone()
+    if not row or not str(row[2] or '').strip():
+        return ''
+
+    _, bot_token = _telegram_widget_credentials(int(tenant_id))
+    if not bot_token:
+        return ''
+
+    payload = _build_subscription_payload(int(tenant_id), int(user_id))
+    invoice = {
+        'title': 'воронка: подписка на 30 дней',
+        'description': 'Доступ к сервису рассылок в Telegram на 30 дней.',
+        'payload': payload,
+        'currency': 'XTR',
+        'prices': [{'label': 'Подписка 30 дней', 'amount': int(BILLING_MONTHLY_STARS)}]
+    }
+    try:
+        return str(_telegram_bot_api_request(bot_token, 'createInvoiceLink', invoice, timeout=20) or '')
+    except Exception as e:
+        logger.error(f"Failed to create invoice link for user {user_id}: {e}")
+        return ''
+
+def _apply_successful_subscription_payment(parsed_payload: dict, message: dict, successful_payment: dict):
+    tenant_id = int(parsed_payload['tenant_id'])
+    user_id = int(parsed_payload['user_id'])
+    telegram_user_id = str(((message or {}).get('from') or {}).get('id') or '').strip()
+    charge_id = str(successful_payment.get('telegram_payment_charge_id') or '').strip()
+    provider_charge_id = str(successful_payment.get('provider_payment_charge_id') or '').strip()
+    amount_stars = int(successful_payment.get('total_amount') or 0)
+    currency = str(successful_payment.get('currency') or 'XTR').strip() or 'XTR'
+
+    now = _utcnow_naive()
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+
+        if charge_id:
+            cursor.execute(
+                '''
+                SELECT 1
+                FROM billing_payments
+                WHERE telegram_payment_charge_id = ?
+                LIMIT 1
+                ''',
+                (charge_id,)
+            )
+            if cursor.fetchone():
+                return False
+
+        cursor.execute(
+            '''
+            SELECT telegram_id, subscription_expires_at
+            FROM users
+            WHERE id = ? AND tenant_id = ?
+            LIMIT 1
+            ''',
+            (user_id, tenant_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            logger.warning(f"Billing payment ignored: user {user_id} not found")
+            return False
+        db_tg_id = str(row[0] or '').strip()
+        if db_tg_id and telegram_user_id and db_tg_id != telegram_user_id:
+            logger.warning(
+                f"Billing payment ignored: telegram mismatch user={user_id} db={db_tg_id} msg={telegram_user_id}"
+            )
+            return False
+
+        current_exp_dt = _parse_db_datetime(row[1])
+        anchor = current_exp_dt if current_exp_dt and current_exp_dt > now else now
+        new_expiry = anchor + timedelta(days=BILLING_PLAN_DAYS)
+
+        cursor.execute(
+            '''
+            UPDATE users
+            SET subscription_expires_at = ?
+            WHERE id = ? AND tenant_id = ?
+            ''',
+            (_format_db_datetime(new_expiry), user_id, tenant_id)
+        )
+        cursor.execute(
+            '''
+            INSERT INTO billing_payments (
+                tenant_id,
+                user_id,
+                telegram_user_id,
+                invoice_payload,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+                amount_stars,
+                currency,
+                paid_at,
+                raw_update_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ''',
+            (
+                tenant_id,
+                user_id,
+                telegram_user_id,
+                str(successful_payment.get('invoice_payload') or ''),
+                charge_id or None,
+                provider_charge_id or None,
+                amount_stars,
+                currency,
+                json.dumps({'message': message, 'successful_payment': successful_payment}, ensure_ascii=False)
+            )
+        )
+        conn.commit()
+
+    logger.info(
+        "Billing payment applied: tenant=%s user=%s stars=%s expires=%s",
+        tenant_id,
+        user_id,
+        amount_stars,
+        _format_db_datetime(new_expiry)
+    )
+    return True
+
+def _handle_billing_update(bot_token: str, update: dict):
+    if not isinstance(update, dict):
+        return
+    pre_checkout_query = update.get('pre_checkout_query') if isinstance(update.get('pre_checkout_query'), dict) else None
+    if pre_checkout_query:
+        query_id = str(pre_checkout_query.get('id') or '').strip()
+        payload = _parse_subscription_payload(pre_checkout_query.get('invoice_payload'))
+        from_id = str((pre_checkout_query.get('from') or {}).get('id') or '').strip()
+        ok = False
+        error_message = 'Платеж недоступен для этого аккаунта'
+        if payload:
+            with sqlite3.connect(db.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT telegram_id
+                    FROM users
+                    WHERE id = ? AND tenant_id = ?
+                    LIMIT 1
+                    ''',
+                    (int(payload['user_id']), int(payload['tenant_id']))
+                )
+                row = cursor.fetchone()
+            if row:
+                db_tg_id = str(row[0] or '').strip()
+                if not db_tg_id or db_tg_id == from_id:
+                    ok = True
+                    error_message = ''
+        try:
+            req = {'pre_checkout_query_id': query_id, 'ok': bool(ok)}
+            if not ok and error_message:
+                req['error_message'] = error_message[:200]
+            _telegram_bot_api_request(bot_token, 'answerPreCheckoutQuery', req, timeout=15)
+        except Exception as e:
+            logger.error(f"Failed answerPreCheckoutQuery: {e}")
+
+    message = update.get('message') if isinstance(update.get('message'), dict) else None
+    if not message:
+        return
+    successful_payment = message.get('successful_payment') if isinstance(message.get('successful_payment'), dict) else None
+    if not successful_payment:
+        return
+    payload = _parse_subscription_payload(successful_payment.get('invoice_payload'))
+    if not payload:
+        return
+    try:
+        _apply_successful_subscription_payment(payload, message, successful_payment)
+    except Exception as e:
+        logger.error(f"Failed to apply successful payment: {e}")
+
+def _telegram_widget_validate(auth_payload: dict, bot_token: str) -> dict:
+    if not bot_token:
+        raise RuntimeError('Telegram bot token is not configured')
+    payload = dict(auth_payload or {})
+    check_hash = str(payload.get('hash') or '').strip()
+    if not check_hash:
+        raise RuntimeError('Telegram hash is required')
+
+    # Optional freshness check (24h)
+    auth_date_raw = str(payload.get('auth_date') or '').strip()
+    if auth_date_raw:
+        try:
+            auth_ts = int(auth_date_raw)
+            if abs(int(time.time()) - auth_ts) > 86400:
+                raise RuntimeError('Telegram auth payload expired')
+        except ValueError:
+            raise RuntimeError('Invalid auth_date')
+
+    data_check_items = []
+    for key in sorted(payload.keys()):
+        if key == 'hash':
+            continue
+        value = payload.get(key)
+        if value is None:
+            continue
+        value_str = str(value)
+        if value_str == '':
+            continue
+        data_check_items.append(f"{key}={value_str}")
+
+    data_check_string = '\n'.join(data_check_items)
+    secret_key = hashlib.sha256(bot_token.encode('utf-8')).digest()
+    expected_hash = hmac.new(secret_key, data_check_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_hash, check_hash):
+        raise RuntimeError('Telegram auth hash mismatch')
+    return payload
+
+def _upsert_user_from_telegram(
+    mode: str,
+    tenant_id: int,
+    tg_id: str,
+    tg_username: str,
+    tg_name: str,
+    tg_phone: str,
+    tg_picture: str
+) -> dict:
+    mode = str(mode or 'login').strip().lower()
+    if mode not in ('login', 'register'):
+        mode = 'login'
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            '''
+            SELECT
+                id,
+                tenant_id,
+                username,
+                role,
+                is_active,
+                telegram_id,
+                trial_started_at,
+                trial_ends_at,
+                subscription_expires_at
+            FROM users
+            WHERE telegram_id = ?
+            LIMIT 1
+            ''',
+            (tg_id,)
+        )
+        existing = cursor.fetchone()
+
+        if not existing and tg_username:
+            # Migration bridge: link an existing profile with same username (case-insensitive)
+            # only if Telegram is not linked yet.
+            cursor.execute(
+                '''
+                SELECT
+                    id,
+                    tenant_id,
+                    username,
+                    role,
+                    is_active,
+                    telegram_id,
+                    trial_started_at,
+                    trial_ends_at,
+                    subscription_expires_at
+                FROM users
+                WHERE telegram_id IS NULL
+                  AND lower(username) = lower(?)
+                LIMIT 1
+                ''',
+                (tg_username,)
+            )
+            existing = cursor.fetchone()
+
+        if existing:
+            cursor.execute(
+                '''
+                UPDATE users
+                SET telegram_id = COALESCE(telegram_id, ?),
+                    telegram_username = ?,
+                    telegram_name = ?,
+                    telegram_phone = ?,
+                    telegram_photo_url = ?,
+                    telegram_auth_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''',
+                (tg_id, tg_username, tg_name, tg_phone, tg_picture, int(existing[0]))
+            )
+            _ensure_user_trial_window(cursor, int(existing[0]))
+            cursor.execute(
+                '''
+                SELECT
+                    id,
+                    tenant_id,
+                    username,
+                    role,
+                    is_active,
+                    telegram_id,
+                    trial_started_at,
+                    trial_ends_at,
+                    subscription_expires_at
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                ''',
+                (int(existing[0]),)
+            )
+            existing = cursor.fetchone()
+            conn.commit()
+
+            if not bool(existing[4]):
+                return {
+                    'status': 'pending',
+                    'message': 'Заявка найдена, ожидайте активацию админом',
+                    'user_id': int(existing[0])
+                }
+
+            billing = _billing_state(existing[7], existing[8])
+            if not billing.get('active'):
+                payment_url = _create_subscription_invoice_link(int(existing[0]), int(existing[1]))
+                return {
+                    'status': 'payment_required',
+                    'message': billing.get('message') or 'Триал закончился. Оплатите подписку.',
+                    'payment_url': payment_url,
+                    'stars_price': BILLING_MONTHLY_STARS,
+                    'trial_days': BILLING_TRIAL_DAYS
+                }
+
+            session['user_id'] = int(existing[0])
+            session['tenant_id'] = int(existing[1])
+            return {
+                'status': 'ok',
+                'next': '/',
+                'user': {
+                    'id': int(existing[0]),
+                    'tenant_id': int(existing[1]),
+                    'username': str(existing[2] or ''),
+                    'role': ('admin' if str(existing[3] or '').lower() in ('admin', 'owner') else 'user')
+                }
+            }
+
+        if mode == 'login':
+            return {
+                'status': 'not_found',
+                'message': 'Пользователь не найден. Сначала зарегистрируйтесь через Telegram'
+            }
+
+        base_username = _telegram_username_base(tg_username, tg_id)
+        username = _telegram_unique_username(cursor, base_username)
+        random_password = secrets.token_urlsafe(32)
+        cursor.execute(
+            '''
+            INSERT INTO users (
+                tenant_id, username, password_hash, role, is_active,
+                telegram_id, telegram_username, telegram_name, telegram_phone, telegram_photo_url, telegram_auth_at,
+                trial_started_at, trial_ends_at
+            )
+            VALUES (?, ?, ?, 'user', 0, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, datetime(CURRENT_TIMESTAMP, ?))
+            ''',
+            (
+                tenant_id,
+                username,
+                generate_password_hash(random_password),
+                tg_id,
+                tg_username,
+                tg_name,
+                tg_phone,
+                tg_picture,
+                f'+{BILLING_TRIAL_DAYS} day'
+            )
+        )
+        conn.commit()
+        return {
+            'status': 'pending',
+            'message': 'Регистрация через Telegram создана. Ожидайте активацию админом',
+            'username': username
+        }
+
+def _telegram_discovery() -> dict:
+    now = time.time()
+    cached = _telegram_discovery_cache.get('data')
+    if cached and (now - float(_telegram_discovery_cache.get('at') or 0)) < 3600:
+        return cached
+    response = requests.get(TELEGRAM_OIDC_DISCOVERY, timeout=20)
+    response.raise_for_status()
+    data = response.json() or {}
+    if not data.get('authorization_endpoint') or not data.get('token_endpoint') or not data.get('jwks_uri'):
+        raise RuntimeError('Telegram OIDC discovery is incomplete')
+    _telegram_discovery_cache['data'] = data
+    _telegram_discovery_cache['at'] = now
+    return data
+
+def _telegram_redirect_uri() -> str:
+    if TELEGRAM_LOGIN_REDIRECT_URI:
+        return TELEGRAM_LOGIN_REDIRECT_URI
+    return url_for('telegram_oauth_callback', _external=True)
+
+def _telegram_id_token_claims(id_token: str, client_id: str, nonce=None) -> dict:
+    if jwt is None or PyJWKClient is None:
+        raise RuntimeError('PyJWT is required for Telegram OIDC login')
+    discovery = _telegram_discovery()
+    issuer = str(discovery.get('issuer') or 'https://oauth.telegram.org').strip()
+    jwks_uri = str(discovery.get('jwks_uri') or '').strip()
+    if not jwks_uri:
+        raise RuntimeError('Telegram JWKS URI not found')
+
+    global _telegram_jwks_client, _telegram_jwks_uri
+    if (_telegram_jwks_client is None) or (_telegram_jwks_uri != jwks_uri):
+        _telegram_jwks_client = PyJWKClient(jwks_uri)
+        _telegram_jwks_uri = jwks_uri
+
+    signing_key = _telegram_jwks_client.get_signing_key_from_jwt(id_token)
+    claims = jwt.decode(
+        id_token,
+        signing_key.key,
+        algorithms=['RS256', 'ES256', 'EdDSA'],
+        audience=str(client_id),
+        issuer=issuer,
+        options={'require': ['exp', 'iat']}
+    )
+    if nonce:
+        token_nonce = str(claims.get('nonce') or '')
+        if token_nonce != str(nonce):
+            raise RuntimeError('Invalid Telegram nonce')
+    return claims
+
+def _telegram_username_base(preferred_username: str, tg_id: str) -> str:
+    candidate = re.sub(r'[^a-zA-Z0-9_\\.-]', '_', str(preferred_username or '').strip())
+    candidate = candidate.strip('._-')
+    if not candidate:
+        candidate = f'tg_{tg_id}'
+    if len(candidate) > 64:
+        candidate = candidate[:64]
+    if len(candidate) < 3:
+        candidate = f'tg_{tg_id}'
+    return candidate
+
+def _telegram_unique_username(cursor, base_username: str) -> str:
+    username = base_username
+    suffix = 1
+    while True:
+        cursor.execute('SELECT 1 FROM users WHERE username = ? LIMIT 1', (username,))
+        if not cursor.fetchone():
+            return username
+        suffix += 1
+        username = f"{base_username}_{suffix}"
+        if len(username) > 64:
+            username = username[:64]
+
+def _telegram_auth_redirect(endpoint: str, message: str = '', error: str = ''):
+    query = {}
+    if message:
+        query['message'] = message
+    if error:
+        query['error'] = error
+    target = url_for(endpoint)
+    if query:
+        target = f"{target}?{urlencode(query)}"
+    return redirect(target)
+
 @app.context_processor
 def inject_current_user():
     return {'current_user': get_current_user()}
@@ -601,35 +1666,32 @@ def enforce_session_auth():
 
     user = get_current_user()
     if user:
+        billing = _billing_state(user.get('trial_ends_at'), user.get('subscription_expires_at'))
+        if not billing.get('active'):
+            session.clear()
+            if request.path.startswith('/api/'):
+                return jsonify({
+                    'error': 'Subscription required',
+                    'status': 'payment_required',
+                    'message': billing.get('message') or 'Триал закончился. Оплатите подписку.',
+                    'stars_price': BILLING_MONTHLY_STARS
+                }), 402
+            return _telegram_auth_redirect(
+                'login_page',
+                error=billing.get('message') or 'Триал закончился. Оплатите подписку.'
+            )
+
         g.current_user = user
         g.tenant_id = int(user['tenant_id'])
         if is_limited_user(user):
             forbidden_prefixes = (
                 '/api/auth/users',
                 '/api/admin/',
-                '/api/proxies',
                 '/api/outreach/scheduler/'
             )
             if any(request.path.startswith(p) for p in forbidden_prefixes):
                 return jsonify({'error': 'Forbidden'}), 403
         return None
-
-    # Fallback: если ранее использовали APP_PASSWORD, разрешаем basic auth и создаём сессию.
-    if APP_PASSWORD:
-        auth = request.authorization
-        if auth and auth.password == APP_PASSWORD:
-            tenant_id = get_default_tenant_id()
-            session['user_id'] = 0
-            session['tenant_id'] = tenant_id
-            g.current_user = {
-                'id': 0,
-                'tenant_id': tenant_id,
-                'username': auth.username or 'basic-auth',
-                'role': 'admin',
-                'is_active': True
-            }
-            g.tenant_id = tenant_id
-            return None
 
     if request.path.startswith('/api/'):
         return jsonify({'error': 'Unauthorized'}), 401
@@ -641,22 +1703,49 @@ checker_status = {
     'current_phone': '',
     'processed': 0,
     'total': 0,
+    'input_total': 0,
+    'unique_total': 0,
+    'skipped_duplicates': 0,
+    'skipped_existing_in_base': 0,
+    'skipped_history_registered': 0,
+    'skipped_history_not_registered': 0,
+    'skipped_history_total': 0,
     'registered': 0,
     'not_registered': 0,
     'errors': 0,
     'test_checks': 0,
     'accounts': [],
     'start_time': None,
-    'estimated_time': None
+    'estimated_time': None,
+    'recent_results': []
 }
 
+def push_recent_result(payload: dict):
+    if payload is None:
+        return
+    recent = checker_status.get('recent_results') or []
+    recent.append(payload)
+    if len(recent) > 200:
+        recent = recent[-200:]
+    checker_status['recent_results'] = recent
+checker_emit_queue = deque()
+checker_emit_lock = NativeLock()
+checker_emitter_started = False
+checker_emitter_start_lock = NativeLock()
+ENABLE_CHECKER_SOCKET_EVENTS = os.getenv('ENABLE_CHECKER_SOCKET_EVENTS', '0') == '1'
+
 qr_auth_sessions = {}
-qr_auth_lock = threading.Lock()
+qr_auth_lock = NativeLock()
 
 scheduler_thread = None
 scheduler = None
 last_scheduler_autostart_check_at = 0.0
 SCHEDULER_AUTOSTART_CHECK_INTERVAL_SECONDS = 10
+
+billing_bot_thread = None
+billing_bot_stop_event = NativeEvent()
+last_billing_worker_check_at = 0.0
+BILLING_WORKER_CHECK_INTERVAL_SECONDS = 15
 
 def is_scheduler_running():
     return scheduler_thread is not None and scheduler_thread.is_alive()
@@ -685,6 +1774,112 @@ def ensure_scheduler_running():
     scheduler_thread.start()
     return True
 
+def queue_checker_emit(event_name: str, payload=None):
+    if not ENABLE_CHECKER_SOCKET_EVENTS:
+        return
+    with checker_emit_lock:
+        checker_emit_queue.append((event_name, payload if payload is not None else {}))
+
+def checker_emit_worker():
+    while True:
+        batch = []
+        with checker_emit_lock:
+            while checker_emit_queue and len(batch) < 200:
+                batch.append(checker_emit_queue.popleft())
+        for event_name, payload in batch:
+            try:
+                socketio.emit(event_name, payload)
+            except Exception as e:
+                logger.warning(f"Checker emitter failed ({event_name}): {e}")
+        socketio.sleep(0.01 if batch else 0.05)
+
+def ensure_checker_emitter_started():
+    if not ENABLE_CHECKER_SOCKET_EVENTS:
+        return
+    global checker_emitter_started
+    if checker_emitter_started:
+        return
+    with checker_emitter_start_lock:
+        if checker_emitter_started:
+            return
+        socketio.start_background_task(checker_emit_worker)
+        checker_emitter_started = True
+
+def _billing_updates_offset_get() -> int:
+    raw = str(db.get_config('billing_bot_updates_offset', default='0') or '0').strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = 0
+    return max(0, value)
+
+def _billing_updates_offset_set(value: int):
+    db.set_config('billing_bot_updates_offset', str(max(0, int(value))))
+
+def _billing_poll_once(bot_token: str):
+    offset = _billing_updates_offset_get()
+    payload = {
+        'offset': offset,
+        'timeout': 25,
+        'allowed_updates': ['pre_checkout_query', 'message']
+    }
+    updates = _telegram_bot_api_request(bot_token, 'getUpdates', payload, timeout=40)
+    if not isinstance(updates, list) or not updates:
+        return
+    max_offset = offset
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        try:
+            update_id = int(update.get('update_id') or 0)
+        except Exception:
+            update_id = 0
+        if update_id > 0:
+            max_offset = max(max_offset, update_id + 1)
+        _handle_billing_update(bot_token, update)
+    if max_offset != offset:
+        _billing_updates_offset_set(max_offset)
+
+def _billing_bot_worker_loop(bot_token: str, stop_event):
+    try:
+        try:
+            _telegram_bot_api_request(bot_token, 'deleteWebhook', {'drop_pending_updates': False}, timeout=20)
+        except Exception as e:
+            logger.warning(f"Billing worker: deleteWebhook skipped ({e})")
+
+        while not stop_event.is_set():
+            try:
+                _billing_poll_once(bot_token)
+            except Exception as e:
+                logger.error(f"Billing worker poll error: {e}")
+                time.sleep(5)
+    except Exception as e:
+        logger.error(f"Billing worker stopped unexpectedly: {e}")
+
+def is_billing_worker_running() -> bool:
+    return billing_bot_thread is not None and billing_bot_thread.is_alive()
+
+def ensure_billing_worker_running():
+    global billing_bot_thread, billing_bot_stop_event
+    if not BILLING_BOT_POLLING_ENABLED:
+        return False
+    if is_billing_worker_running():
+        return False
+    tenant_id = get_default_tenant_id()
+    _, bot_token = _telegram_widget_credentials(tenant_id)
+    if not bot_token:
+        return False
+
+    billing_bot_stop_event = NativeEvent()
+
+    def run_worker():
+        _billing_bot_worker_loop(bot_token, billing_bot_stop_event)
+
+    billing_bot_thread = NativeThread(target=run_worker, daemon=True)
+    billing_bot_thread.start()
+    logger.info("▶ Billing bot worker started")
+    return True
+
 
 @app.before_request
 def ensure_scheduler_autostart():
@@ -707,6 +1902,18 @@ def ensure_scheduler_autostart():
     except Exception as e:
         logger.error(f"Failed scheduler autostart hook: {e}")
 
+@app.before_request
+def ensure_billing_worker_autostart():
+    global last_billing_worker_check_at
+    now_mono = time.monotonic()
+    if now_mono - last_billing_worker_check_at < BILLING_WORKER_CHECK_INTERVAL_SECONDS:
+        return
+    last_billing_worker_check_at = now_mono
+    try:
+        ensure_billing_worker_running()
+    except Exception as e:
+        logger.error(f"Failed billing worker autostart hook: {e}")
+
 def has_active_campaigns():
     try:
         with sqlite3.connect(db.db_path) as conn:
@@ -718,15 +1925,233 @@ def has_active_campaigns():
         return False
 
 class TelegramCheckerThread(NativeThread):
-    def __init__(self, api_id, api_hash, target_chat, phones_list, delay=2):
+    def __init__(
+        self,
+        api_id,
+        api_hash,
+        target_chat,
+        phones_list,
+        delay=2,
+        tenant_id: int = 1,
+        target_base_id: int = None,
+        phone_metadata: dict = None
+    ):
         NativeThread.__init__(self)
         self.api_id = api_id
         self.api_hash = api_hash
-        self.target_chat = target_chat
+        self.target_chat = normalize_chat_ref(target_chat)
         self.phones_list = phones_list
+        self.raw_total = len(phones_list or [])
         self.delay = delay
+        self.tenant_id = int(tenant_id or 1)
+        self.target_base_id = int(target_base_id) if target_base_id else None
+        self.phone_metadata = phone_metadata or {}
         self.loop = None
         self.processed_count = 0
+        self.non_writable_chat_clients = set()
+        self._write_forbidden_reported = False
+
+    def _emit(self, event_name: str, payload=None):
+        # Под gunicorn+eventlet checker выполняется в отдельном OS-thread.
+        # Кросс-тред socket emit может падать greenlet.error.
+        # UI в любом случае восстанавливает прогресс через /api/status polling.
+        queue_checker_emit(event_name, payload)
+
+    def _remember_checker_file(self, filename: str, file_type: str):
+        if not filename:
+            return
+        key = 'checker_last_files'
+        now_iso = datetime.now().isoformat()
+        try:
+            raw = db.get_config(key, default='[]', tenant_id=self.tenant_id)
+            items = json.loads(raw) if raw else []
+            if not isinstance(items, list):
+                items = []
+        except Exception:
+            items = []
+
+        items = [it for it in items if str((it or {}).get('filename') or '') != filename]
+        items.insert(0, {
+            'filename': filename,
+            'type': file_type or 'file',
+            'created_at': now_iso
+        })
+        items = items[:20]
+        try:
+            db.set_config(key, json.dumps(items, ensure_ascii=False), tenant_id=self.tenant_id)
+        except Exception as e:
+            logger.warning(f"Failed to persist checker file list (tenant={self.tenant_id}): {e}")
+
+    async def _send_contact_card_via_any_checker(self, manager, payload: dict, preferred_client=None) -> bool:
+        accounts = list(getattr(manager, 'accounts', []) or [])
+        if not accounts:
+            return False
+
+        ordered = []
+        if preferred_client is not None:
+            for client, stats in accounts:
+                if client is preferred_client:
+                    ordered.append((client, stats))
+                    break
+        for client, stats in accounts:
+            if preferred_client is not None and client is preferred_client:
+                continue
+            ordered.append((client, stats))
+
+        had_attempt = False
+        non_forbidden_error_seen = False
+        for client, stats in ordered:
+            client_key = id(client)
+            if client_key in self.non_writable_chat_clients and client is not preferred_client:
+                continue
+
+            send_payload = dict(payload or {})
+            send_payload['account_used'] = stats.phone or send_payload.get('account_used')
+            ok, err_code = await manager.send_contact_card(
+                client,
+                self.target_chat,
+                send_payload,
+                return_error=True
+            )
+            had_attempt = True
+            if ok:
+                return True
+            if err_code == 'chat_write_forbidden':
+                self.non_writable_chat_clients.add(client_key)
+            else:
+                non_forbidden_error_seen = True
+
+        if had_attempt and not non_forbidden_error_seen and not self._write_forbidden_reported:
+            self._write_forbidden_reported = True
+            self._emit('warning', {
+                'message': 'Нет прав писать в целевой чат: карточки не отправляются. '
+                           'Проверьте, что checker-аккаунтам разрешено отправлять сообщения в этот чат.'
+            })
+        return False
+
+    async def _checker_account_can_send_card(self, client) -> bool:
+        """Проверка, что аккаунт реально может отправлять визитки (media) в target chat."""
+        try:
+            chat_entity = await client.get_entity(self.target_chat)
+        except Exception:
+            return False
+        try:
+            perms = await client.get_permissions(chat_entity, 'me')
+        except Exception as e:
+            error_text = str(e).lower()
+            if 'not a member' in error_text or 'usernotparticipant' in error_text:
+                return False
+            # Консервативно: если не удалось определить права, аккаунт не используем.
+            return False
+
+        if getattr(perms, 'is_banned', False):
+            return False
+        banned = getattr(perms, 'banned_rights', None)
+        if banned:
+            if getattr(banned, 'send_messages', False):
+                return False
+            if getattr(banned, 'send_media', False):
+                return False
+        return True
+
+    async def _invite_checker_accounts_via_admin(self, blocked_pairs):
+        """
+        Пытается пригласить checker-аккаунты в target chat через админскую service-сессию.
+        Используется как fallback, когда checker-аккаунт сам не может писать в чат.
+        """
+        inviter_phone = "19494793880"
+        if not blocked_pairs:
+            return 0
+
+        session_name = None
+        inviter_tenant_id = None
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT tenant_id, session_name
+                FROM account_stats
+                WHERE phone = ?
+                  AND is_banned = 0
+                  AND is_frozen = 0
+                ORDER BY
+                    CASE WHEN tenant_id = ? THEN 0 ELSE 1 END,
+                    CASE WHEN account_type = 'service' THEN 0 ELSE 1 END,
+                    tenant_id ASC
+                LIMIT 1
+                ''',
+                (inviter_phone, self.tenant_id)
+            )
+            row = cursor.fetchone()
+            if row and row[1]:
+                inviter_tenant_id = row[0]
+                session_name = str(row[1]).strip()
+
+        if not session_name:
+            logger.warning("Admin inviter session not found for phone 19494793880")
+            return 0
+
+        session_path = os.path.join('sessions', session_name)
+        if not os.path.exists(session_path + '.session'):
+            logger.warning("Admin inviter session file not found for phone 19494793880")
+            return 0
+
+        inviter = TelegramClient(session_path, api_id=int(self.api_id), api_hash=self.api_hash)
+        invited_count = 0
+        try:
+            await inviter.connect()
+            if not await inviter.is_user_authorized():
+                logger.warning("Admin inviter session 19494793880 is not authorized")
+                return 0
+            logger.info(
+                "Admin inviter selected: phone=19494793880 session=%s tenant_id=%s",
+                session_name,
+                inviter_tenant_id
+            )
+
+            try:
+                chat_entity = await inviter.get_entity(self.target_chat)
+            except Exception as e:
+                logger.warning(f"Admin inviter cannot resolve target chat {self.target_chat}: {e}")
+                return 0
+
+            for checker_client, checker_stats in blocked_pairs:
+                try:
+                    me = await checker_client.get_me()
+                    if not me or not getattr(me, 'id', None) or not getattr(me, 'access_hash', None):
+                        continue
+                    input_user = InputUser(user_id=me.id, access_hash=me.access_hash)
+                    try:
+                        await inviter(InviteToChannelRequest(channel=chat_entity, users=[input_user]))
+                        invited_count += 1
+                        try:
+                            manager_db = getattr(self, '_manager_db', None)
+                            if manager_db:
+                                manager_db.mark_chat_joined(checker_stats.phone, self.target_chat)
+                        except Exception:
+                            pass
+                        logger.info(f"Admin inviter added checker {checker_stats.phone} to target chat")
+                    except errors.UserAlreadyParticipantError:
+                        invited_count += 1
+                        try:
+                            manager_db = getattr(self, '_manager_db', None)
+                            if manager_db:
+                                manager_db.mark_chat_joined(checker_stats.phone, self.target_chat)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning(f"Admin inviter failed for checker {checker_stats.phone}: {e}")
+                    await asyncio.sleep(0.25)
+                except Exception as e:
+                    logger.warning(f"Cannot resolve checker self-user for invite ({checker_stats.phone}): {e}")
+        except Exception as e:
+            logger.warning(f"Admin inviter flow failed: {e}")
+        finally:
+            try:
+                await inviter.disconnect()
+            except Exception:
+                pass
+        return invited_count
         
     def run(self):
         global checker_status
@@ -740,8 +2165,8 @@ class TelegramCheckerThread(NativeThread):
         except Exception as e:
             logger.exception(f"Checker thread crashed: {e}")
             checker_status['running'] = False
-            socketio.emit('error', {'message': f'Ошибка запуска проверки: {str(e)}'})
-            socketio.emit('checker_stopped')
+            self._emit('error', {'message': f'Ошибка запуска проверки: {str(e)}'})
+            self._emit('checker_stopped')
         finally:
             if self.loop:
                 try:
@@ -752,57 +2177,305 @@ class TelegramCheckerThread(NativeThread):
     async def run_checker(self):
         global checker_status
         
-        manager = TelegramAccountManager(self.api_id, self.api_hash, 'sessions')
+        manager = TelegramAccountManager(
+            self.api_id,
+            self.api_hash,
+            'sessions',
+            tenant_id=self.tenant_id
+        )
+        self._manager_db = manager.db
         checker_status['start_time'] = datetime.now().isoformat()
+        checker_status['recent_results'] = []
 
         try:
             loaded = await asyncio.wait_for(
-                manager.load_accounts(self.target_chat),
+                manager.load_accounts(auto_test_new_sessions=False),
                 timeout=120
             )
         except asyncio.TimeoutError:
-            socketio.emit('error', {'message': 'Таймаут инициализации checker-аккаунтов (120с)'})
+            self._emit('error', {'message': 'Таймаут инициализации checker-аккаунтов (120с)'})
             checker_status['running'] = False
-            socketio.emit('checker_stopped')
+            self._emit('checker_stopped')
             return
         except Exception as e:
-            socketio.emit('error', {'message': f'Ошибка инициализации аккаунтов: {str(e)}'})
+            self._emit('error', {'message': f'Ошибка инициализации аккаунтов: {str(e)}'})
             checker_status['running'] = False
-            socketio.emit('checker_stopped')
+            self._emit('checker_stopped')
             return
 
         if not loaded:
-            socketio.emit('error', {'message': 'Не удалось загрузить аккаунты'})
+            self._emit('error', {'message': 'Не удалось загрузить аккаунты'})
             checker_status['running'] = False
             return
-        
-        # Защита от дубликатов
-        successfully_found = manager.db.get_successfully_found_phones()
-        original_count = len(self.phones_list)
-        self.phones_list = [p for p in self.phones_list if p not in successfully_found]
-        skipped_found = original_count - len(self.phones_list)
-        
-        if skipped_found > 0:
-            logger.info(f"⏭️ Пропущено {skipped_found} номеров - уже были найдены ранее")
-            socketio.emit('warning', {
-                'message': f'{skipped_found} номеров уже были найдены и будут пропущены'
+
+        # Для checker важен не только ImportContacts, но и публикация визиток в target chat.
+        # Используем в проверке только аккаунты, которые реально могут отправлять media в target chat.
+        try:
+            await manager.ensure_all_accounts_in_chat(self.target_chat)
+        except Exception as e:
+            logger.warning(f"Не удалось выполнить массовое вступление checker-аккаунтов в target chat: {e}")
+
+        writable_accounts = []
+        blocked_pairs = []
+        for client_obj, stats_obj in list(manager.accounts):
+            can_send_card = await self._checker_account_can_send_card(client_obj)
+            if can_send_card:
+                writable_accounts.append((client_obj, stats_obj))
+            else:
+                blocked_pairs.append((client_obj, stats_obj))
+
+        # Пытаемся довступить blocked checker-аккаунты в target chat через админ-инвайтер.
+        if blocked_pairs:
+            invited = await self._invite_checker_accounts_via_admin(blocked_pairs)
+            if invited:
+                await asyncio.sleep(1.0)
+                reblocked = []
+                for client_obj, stats_obj in blocked_pairs:
+                    can_send_card = await self._checker_account_can_send_card(client_obj)
+                    if can_send_card:
+                        writable_accounts.append((client_obj, stats_obj))
+                    else:
+                        reblocked.append((client_obj, stats_obj))
+                blocked_pairs = reblocked
+                logger.info(f"Checker recheck after admin invite: invited={invited}, still_blocked={len(blocked_pairs)}")
+
+        blocked_accounts = [stats_obj.phone or stats_obj.session_name or 'unknown' for _, stats_obj in blocked_pairs]
+        if blocked_accounts:
+            logger.warning(
+                f"Checker accounts excluded (cannot send card to target chat): {len(blocked_accounts)} "
+                f"-> {blocked_accounts}"
+            )
+            self._emit('warning', {
+                'message': (
+                    f'Исключено checker-аккаунтов без права отправки визиток в целевой чат: '
+                    f'{len(blocked_accounts)}'
+                )
             })
-        
-        if not self.phones_list:
-            socketio.emit('error', {'message': 'Все номера уже были успешно найдены ранее'})
+
+        manager.accounts = writable_accounts
+        if not manager.accounts:
+            self._emit('error', {'message': 'Нет checker-аккаунтов с правом отправки визиток в целевой чат'})
             checker_status['running'] = False
+            self._emit('checker_stopped')
+            return
+        
+        # Нормализуем и дедуплицируем входной список на стороне сервера,
+        # чтобы не тратить лимиты на дубликаты/разные форматы одного номера.
+        normalized_unique = []
+        seen_numbers = set()
+        for raw_phone in self.phones_list:
+            norm = _normalize_phone_value(raw_phone)
+            if not norm or norm in seen_numbers:
+                continue
+            seen_numbers.add(norm)
+            normalized_unique.append(norm)
+        self.phones_list = normalized_unique
+
+        raw_total = int(self.raw_total or 0)
+        unique_total = len(self.phones_list)
+        checker_status['input_total'] = raw_total
+        checker_status['unique_total'] = unique_total
+        checker_status['skipped_duplicates'] = max(0, raw_total - unique_total)
+        checker_status['skipped_existing_in_base'] = 0
+        checker_status['skipped_history_registered'] = 0
+        checker_status['skipped_history_not_registered'] = 0
+        checker_status['skipped_history_total'] = 0
+
+        prefilled_registered = 0
+        prefilled_not_registered = 0
+        skipped_existing_in_base = 0
+
+        if self.target_base_id:
+            # 1) Не проверяем то, что уже присутствует в выбранной базе.
+            try:
+                existing_in_base = outreach.get_base_existing_phones(
+                    base_id=self.target_base_id,
+                    phones=self.phones_list,
+                    tenant_id=self.tenant_id
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось получить список телефонов базы {self.target_base_id}: {e}")
+                existing_in_base = set()
+
+            if existing_in_base:
+                old_len = len(self.phones_list)
+                self.phones_list = [p for p in self.phones_list if p not in existing_in_base]
+                skipped_existing_in_base = old_len - len(self.phones_list)
+                checker_status['skipped_existing_in_base'] = skipped_existing_in_base
+                self._emit('warning', {
+                    'message': f'{skipped_existing_in_base} номеров уже есть в выбранной базе и пропущены'
+                })
+
+            # 2) Для оставшихся подтягиваем последний результат проверки из истории.
+            try:
+                latest_results = manager.db.get_latest_results_for_phones(
+                    self.phones_list,
+                    tenant_id=self.tenant_id
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось получить кеш истории проверок: {e}")
+                latest_results = {}
+
+            cached_contacts = []
+            cached_registered_set = set()
+            cached_not_registered_set = set()
+
+            for norm in self.phones_list:
+                cached = latest_results.get(norm)
+                if not cached:
+                    continue
+                if bool(cached.get('registered')):
+                    meta = self.phone_metadata.get(norm, {})
+                    cached_contacts.append({
+                        'phone': norm,
+                        'user_id': cached.get('user_id'),
+                        'username': cached.get('username'),
+                        'name': meta.get('name') or cached.get('first_name'),
+                        'company': meta.get('company'),
+                        'position': meta.get('position'),
+                        'access_hash': None
+                    })
+                    cached_registered_set.add(norm)
+                else:
+                    cached_not_registered_set.add(norm)
+
+            if cached_contacts:
+                try:
+                    add_result = outreach.add_base_contacts(
+                        base_id=self.target_base_id,
+                        contacts=cached_contacts,
+                        tenant_id=self.tenant_id,
+                        source_file='checker:history_cache'
+                    )
+                    imported_cached = int(add_result.get('imported', 0))
+                    updated_cached = int(add_result.get('updated', 0))
+                    skipped_cached = int(add_result.get('skipped', 0))
+                    logger.info(
+                        f"📦 База {self.target_base_id}: history_cache imported={imported_cached}, "
+                        f"updated={updated_cached}, skipped={skipped_cached}, from_history={len(cached_registered_set)}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось сохранить history-cache в базу {self.target_base_id}: {e}")
+
+                # Важно: для отправки по user_id контакт должен оказаться в целевом чате.
+                # Поэтому контакты, поднятые из истории, тоже публикуем как карточки в target chat.
+                cached_cards_sent = 0
+                cached_cards_failed = 0
+                try:
+                    if manager.accounts:
+                        try:
+                            await manager.ensure_all_accounts_in_chat(self.target_chat)
+                        except Exception as e:
+                            logger.warning(f"Не удалось синхронизировать checker-аккаунты с target chat: {e}")
+                        per_card_delay = max(0.35, float(self.delay or 0))
+
+                        for cached in cached_contacts:
+                            payload = {
+                                'phone': cached.get('phone'),
+                                'user_id': cached.get('user_id'),
+                                'username': cached.get('username'),
+                                'first_name': cached.get('name') or 'Контакт',
+                                'last_name': '',
+                                'account_used': 'history_cache',
+                                'is_test': False
+                            }
+                            sent = await self._send_contact_card_via_any_checker(manager, payload)
+                            if sent:
+                                cached_cards_sent += 1
+                            else:
+                                cached_cards_failed += 1
+                            await asyncio.sleep(per_card_delay)
+
+                        logger.info(
+                            f"📨 Target chat sync from history-cache: sent={cached_cards_sent}, "
+                            f"failed={cached_cards_failed}, total={len(cached_contacts)}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Ошибка отправки history-cache карточек в target chat: {e}")
+
+            prefilled_registered = len(cached_registered_set)
+            prefilled_not_registered = len(cached_not_registered_set)
+            checker_status['skipped_history_registered'] = prefilled_registered
+            checker_status['skipped_history_not_registered'] = prefilled_not_registered
+            checker_status['skipped_history_total'] = prefilled_registered + prefilled_not_registered
+
+            cached_any = cached_registered_set | cached_not_registered_set
+            if cached_any:
+                self.phones_list = [p for p in self.phones_list if p not in cached_any]
+                self._emit('warning', {
+                    'message': (
+                        f'Из истории пропущено: найдено {prefilled_registered}, '
+                        f'не найдено {prefilled_not_registered}'
+                    )
+                })
+
+        else:
+            # Без сохранения в базу также не гоняем номера по второму кругу:
+            # если номер уже проверялся раньше (найден или нет), пропускаем.
+            try:
+                latest_results = manager.db.get_latest_results_for_phones(
+                    self.phones_list,
+                    tenant_id=self.tenant_id
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось получить кеш истории проверок: {e}")
+                latest_results = {}
+
+            if latest_results:
+                cached_checked = set(latest_results.keys())
+                prefilled_registered = sum(
+                    1 for p in cached_checked if bool(latest_results.get(p, {}).get('registered'))
+                )
+                prefilled_not_registered = len(cached_checked) - prefilled_registered
+                checker_status['skipped_history_registered'] = prefilled_registered
+                checker_status['skipped_history_not_registered'] = prefilled_not_registered
+                checker_status['skipped_history_total'] = prefilled_registered + prefilled_not_registered
+                self.phones_list = [p for p in self.phones_list if p not in cached_checked]
+                self._emit('warning', {
+                    'message': (
+                        f'Пропущены ранее проверенные номера: найдено {prefilled_registered}, '
+                        f'не найдено {prefilled_not_registered}'
+                    )
+                })
+
+        # Учитываем кэш-результаты в общей статистике текущего запуска.
+        checker_status['registered'] += prefilled_registered
+        checker_status['not_registered'] += prefilled_not_registered
+
+        if not self.phones_list:
+            if prefilled_registered > 0 or prefilled_not_registered > 0 or skipped_existing_in_base > 0:
+                self._emit('checker_complete', {
+                    'registered': prefilled_registered,
+                    'not_registered': prefilled_not_registered,
+                    'errors': 0,
+                    'invalid': 0,
+                    'test_checks': checker_status['test_checks']
+                })
+                await manager.close_all()
+                checker_status['running'] = False
+                self._emit('checker_stopped')
+                return
+
+            self._emit('error', {'message': 'Нет новых номеров для проверки'})
+            checker_status['running'] = False
+            self._emit('checker_stopped')
             return
         
         checker_status['accounts'] = []
         for client, stats in manager.accounts:
+            is_working = True
             checker_status['accounts'].append({
                 'phone': stats.phone,
                 'checked_today': stats.checked_today,
                 'total_checked': stats.total_checked,
-                'can_use': stats.can_use_today()
+                'can_use': stats.can_use_today(),
+                'account_type': stats.account_type,
+                'test_quality': stats.test_quality,
+                'daily_limit': stats.get_daily_limit(),
+                'is_working': is_working
             })
         
-        socketio.emit('accounts_update', checker_status['accounts'])
+        self._emit('accounts_update', checker_status['accounts'])
         
         results = {
             'registered': [],
@@ -836,13 +2509,18 @@ class TelegramCheckerThread(NativeThread):
                 
                 checker_status['accounts'] = []
                 for client, stats in manager.accounts:
+                    is_working = True
                     checker_status['accounts'].append({
                         'phone': stats.phone,
                         'checked_today': stats.checked_today,
                         'total_checked': stats.total_checked,
-                        'can_use': stats.can_use_today()
+                        'can_use': stats.can_use_today(),
+                        'account_type': stats.account_type,
+                        'test_quality': stats.test_quality,
+                        'daily_limit': stats.get_daily_limit(),
+                        'is_working': is_working
                     })
-                socketio.emit('accounts_update', checker_status['accounts'])
+                self._emit('accounts_update', checker_status['accounts'])
                 
                 phone = self.phones_list[i]
             
@@ -861,11 +2539,11 @@ class TelegramCheckerThread(NativeThread):
                 except Exception:
                     checker_status['estimated_time'] = None
             
-            socketio.emit('progress_update', checker_status)
+            self._emit('progress_update', checker_status)
             
             account_data = await manager.get_next_account()
             if not account_data:
-                socketio.emit('warning', {'message': 'Нет доступных аккаунтов'})
+                self._emit('warning', {'message': 'Нет доступных аккаунтов'})
                 break
             
             client, stats = account_data
@@ -874,25 +2552,62 @@ class TelegramCheckerThread(NativeThread):
             if result is None:
                 results['errors'].append(phone)
                 checker_status['errors'] += 1
-                socketio.emit('phone_result', {
+                payload = {
                     'phone': phone,
                     'status': 'error',
                     'message': 'Ошибка проверки'
-                })
+                }
+                push_recent_result(payload)
+                self._emit('phone_result', payload)
             elif 'error' in result:
                 results['invalid'].append(phone)
-                socketio.emit('phone_result', {
+                payload = {
                     'phone': phone,
                     'status': 'invalid',
                     'message': f"Ошибка: {result['error']}"
-                })
+                }
+                push_recent_result(payload)
+                self._emit('phone_result', payload)
             elif result['registered']:
                 results['registered'].append(result)
                 checker_status['registered'] += 1
                 
-                await manager.send_contact_card(client, self.target_chat, result)
+                sent_to_chat = await self._send_contact_card_via_any_checker(
+                    manager,
+                    result,
+                    preferred_client=client
+                )
+                if sent_to_chat and self.target_base_id:
+                    phone_key = _normalize_phone_value(result.get('phone'))
+                    meta = self.phone_metadata.get(phone_key, {}) if phone_key else {}
+                    contact = {
+                        'phone': phone_key,
+                        'user_id': result.get('user_id'),
+                        'username': result.get('username'),
+                        'name': meta.get('name') or result.get('first_name'),
+                        'company': meta.get('company'),
+                        'position': meta.get('position'),
+                        'access_hash': None
+                    }
+                    try:
+                        add_result = outreach.add_base_contacts(
+                            base_id=self.target_base_id,
+                            contacts=[contact],
+                            tenant_id=self.tenant_id,
+                            source_file='checker:file_to_base'
+                        )
+                        imported_now = int(add_result.get('imported', 0))
+                        updated_now = int(add_result.get('updated', 0))
+                        skipped_now = int(add_result.get('skipped', 0))
+                        if imported_now + updated_now == 0:
+                            logger.info(
+                                f"База {self.target_base_id}: контакт {phone_key} не добавлен (duplicate/skip), "
+                                f"skipped={skipped_now}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Не удалось сохранить контакт в базу {self.target_base_id}: {e}")
                 
-                socketio.emit('phone_result', {
+                payload = {
                     'phone': phone,
                     'status': 'registered',
                     'is_test': result.get('is_test', False),
@@ -902,28 +2617,37 @@ class TelegramCheckerThread(NativeThread):
                         'first_name': result.get('first_name'),
                         'last_name': result.get('last_name')
                     }
-                })
+                }
+                push_recent_result(payload)
+                self._emit('phone_result', payload)
             else:
                 results['not_registered'].append(phone)
                 checker_status['not_registered'] += 1
-                socketio.emit('phone_result', {
+                payload = {
                     'phone': phone,
                     'status': 'not_registered',
                     'is_test': result.get('is_test', False),
                     'message': 'Не зарегистрирован'
-                })
+                }
+                push_recent_result(payload)
+                self._emit('phone_result', payload)
             
             await asyncio.sleep(self.delay)
             
             checker_status['accounts'] = []
             for client, stats in manager.accounts:
+                is_working = True
                 checker_status['accounts'].append({
                     'phone': stats.phone,
                     'checked_today': stats.checked_today,
                     'total_checked': stats.total_checked,
-                    'can_use': stats.can_use_today()
+                    'can_use': stats.can_use_today(),
+                    'account_type': stats.account_type,
+                    'test_quality': stats.test_quality,
+                    'daily_limit': stats.get_daily_limit(),
+                    'is_working': is_working
                 })
-            socketio.emit('accounts_update', checker_status['accounts'])
+            self._emit('accounts_update', checker_status['accounts'])
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -932,25 +2656,28 @@ class TelegramCheckerThread(NativeThread):
             filename = f'registered_{timestamp}.csv'
             filepath = os.path.join(app.config['RESULTS_FOLDER'], filename)
             df_reg.to_csv(filepath, index=False, encoding='utf-8')
-            socketio.emit('file_ready', {'filename': filename, 'type': 'registered'})
+            self._remember_checker_file(filename, 'registered')
+            self._emit('file_ready', {'filename': filename, 'type': 'registered', 'created_at': datetime.now().isoformat()})
         
         if results['not_registered']:
             filename = f'not_registered_{timestamp}.txt'
             filepath = os.path.join(app.config['RESULTS_FOLDER'], filename)
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(results['not_registered']))
-            socketio.emit('file_ready', {'filename': filename, 'type': 'not_registered'})
+            self._remember_checker_file(filename, 'not_registered')
+            self._emit('file_ready', {'filename': filename, 'type': 'not_registered', 'created_at': datetime.now().isoformat()})
         
         if results['errors']:
             filename = f'errors_{timestamp}.txt'
             filepath = os.path.join(app.config['RESULTS_FOLDER'], filename)
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(results['errors']))
-            socketio.emit('file_ready', {'filename': filename, 'type': 'errors'})
+            self._remember_checker_file(filename, 'errors')
+            self._emit('file_ready', {'filename': filename, 'type': 'errors', 'created_at': datetime.now().isoformat()})
         
-        socketio.emit('checker_complete', {
-            'registered': len(results['registered']),
-            'not_registered': len(results['not_registered']),
+        self._emit('checker_complete', {
+            'registered': prefilled_registered + len(results['registered']),
+            'not_registered': prefilled_not_registered + len(results['not_registered']),
             'errors': len(results['errors']),
             'invalid': len(results['invalid']),
             'test_checks': checker_status['test_checks']
@@ -958,7 +2685,7 @@ class TelegramCheckerThread(NativeThread):
         
         await manager.close_all()
         checker_status['running'] = False
-        socketio.emit('checker_stopped')
+        self._emit('checker_stopped')
 
 def _is_checker_thread_alive() -> bool:
     global checker_process
@@ -986,6 +2713,10 @@ def index():
 def outreach_page():
     return render_template('outreach.html')
 
+@app.route('/replies')
+def replies_page():
+    return render_template('replies.html')
+
 @app.route('/bases')
 def bases_page():
     return render_template('bases.html')
@@ -1009,13 +2740,31 @@ def users_page():
 def login_page():
     if get_current_user():
         return redirect(url_for('index'))
-    return render_template('login.html')
+    tenant_id = get_default_tenant_id()
+    bot_username, _ = _telegram_widget_credentials(tenant_id)
+    return render_template(
+        'login.html',
+        telegram_bot_username=bot_username,
+        auth_message=str(request.args.get('message') or '').strip(),
+        auth_error=str(request.args.get('error') or '').strip()
+    )
 
 @app.route('/register')
 def register_page():
     if get_current_user():
         return redirect(url_for('index'))
-    return render_template('register.html')
+    tenant_id = get_default_tenant_id()
+    bot_username, _ = _telegram_widget_credentials(tenant_id)
+    return render_template(
+        'register.html',
+        telegram_bot_username=bot_username,
+        auth_message=str(request.args.get('message') or '').strip(),
+        auth_error=str(request.args.get('error') or '').strip()
+    )
+
+@app.route('/oferta')
+def oferta_page():
+    return render_template('oferta.html')
 
 @app.route('/logout', methods=['GET', 'POST'])
 def logout_page():
@@ -1024,80 +2773,128 @@ def logout_page():
         return jsonify({'status': 'ok'})
     return redirect(url_for('login_page'))
 
+@app.route('/api/auth/telegram/start', methods=['GET'])
+def api_telegram_auth_start():
+    mode = str(request.args.get('mode') or 'login').strip().lower()
+    if mode not in ('login', 'register'):
+        mode = 'login'
+    target = 'login_page' if mode == 'login' else 'register_page'
+    return _telegram_auth_redirect(
+        target,
+        message='Используйте кнопку Telegram Login на странице для входа'
+    )
+
+@app.route('/api/auth/telegram/widget', methods=['POST'])
+def api_telegram_auth_widget():
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get('mode') or 'login').strip().lower()
+    auth_data = data.get('auth') if isinstance(data.get('auth'), dict) else data
+
+    tenant_id = get_default_tenant_id()
+    _, bot_token = _telegram_widget_credentials(tenant_id)
+    if not bot_token:
+        return jsonify({'error': 'Telegram bot token не настроен'}), 500
+
+    try:
+        payload = _telegram_widget_validate(auth_data, bot_token)
+    except Exception as e:
+        logger.warning(f"Telegram widget auth validation failed: {e}")
+        return jsonify({'error': 'Невалидные данные Telegram авторизации'}), 401
+
+    tg_id = str(payload.get('id') or '').strip()
+    if not tg_id:
+        return jsonify({'error': 'Telegram ID отсутствует'}), 400
+
+    tg_username = str(payload.get('username') or '').strip()
+    full_name = ' '.join(
+        p for p in [
+            str(payload.get('first_name') or '').strip(),
+            str(payload.get('last_name') or '').strip()
+        ] if p
+    ).strip()
+    tg_phone = str(payload.get('phone_number') or '').strip()
+    tg_picture = str(payload.get('photo_url') or '').strip()
+
+    result = _upsert_user_from_telegram(
+        mode=mode,
+        tenant_id=tenant_id,
+        tg_id=tg_id,
+        tg_username=tg_username,
+        tg_name=full_name,
+        tg_phone=tg_phone,
+        tg_picture=tg_picture
+    )
+    if result.get('status') == 'ok':
+        return jsonify({'status': 'ok', 'next': result.get('next') or '/'})
+    if result.get('status') == 'pending':
+        return jsonify({'status': 'pending', 'message': result.get('message') or 'Ожидайте активацию'}), 200
+    if result.get('status') == 'payment_required':
+        return jsonify({
+            'status': 'payment_required',
+            'message': result.get('message') or 'Требуется оплата подписки',
+            'payment_url': result.get('payment_url') or '',
+            'stars_price': int(result.get('stars_price') or BILLING_MONTHLY_STARS),
+            'trial_days': int(result.get('trial_days') or BILLING_TRIAL_DAYS)
+        }), 402
+    if result.get('status') == 'not_found':
+        return jsonify({'status': 'not_found', 'error': result.get('message') or 'Пользователь не найден'}), 404
+    return jsonify({'error': 'Ошибка Telegram авторизации'}), 500
+
+@app.route('/auth/telegram/callback', methods=['GET'])
+def telegram_oauth_callback():
+    return _telegram_auth_redirect(
+        'login_page',
+        message='Используйте кнопку Telegram Login на странице входа'
+    )
+
 @app.route('/api/auth/login', methods=['POST'])
 def api_login():
-    data = request.get_json(silent=True) or {}
-    username = str(data.get('username') or '').strip()
-    password = str(data.get('password') or '')
-    if not username or not password:
-        return jsonify({'error': 'username and password are required'}), 400
-
-    with sqlite3.connect(db.db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, tenant_id, username, password_hash, role, is_active
-            FROM users
-            WHERE username = ?
-        ''', (username,))
-        row = cursor.fetchone()
-
-    if not row:
-        return jsonify({'error': 'Invalid credentials'}), 401
-    if not bool(row[5]):
-        return jsonify({'error': 'User is inactive'}), 403
-    if not check_password_hash(row[3], password):
-        return jsonify({'error': 'Invalid credentials'}), 401
-
-    session['user_id'] = int(row[0])
-    session['tenant_id'] = int(row[1])
-    raw_role = str(row[4] or '').strip().lower()
-    role = 'admin' if raw_role in ('admin', 'owner') else 'user'
-    return jsonify({
-        'status': 'ok',
-        'user': {
-            'id': int(row[0]),
-            'tenant_id': int(row[1]),
-            'username': row[2],
-            'role': role
-        }
-    })
+    return jsonify({'error': 'Доступно только через Telegram Login'}), 410
 
 @app.route('/api/auth/register', methods=['POST'])
 def api_register():
-    data = request.get_json(silent=True) or {}
-    username = str(data.get('username') or '').strip()
-    password = str(data.get('password') or '')
-
-    if not username:
-        return jsonify({'error': 'username is required'}), 400
-    if len(password) < 6:
-        return jsonify({'error': 'password must be at least 6 chars'}), 400
-    if ' ' in username:
-        return jsonify({'error': 'username must not contain spaces'}), 400
-
-    tenant_id = get_default_tenant_id()
-    with sqlite3.connect(db.db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
-        if cursor.fetchone():
-            return jsonify({'error': 'Username already exists'}), 409
-        cursor.execute('''
-            INSERT INTO users (tenant_id, username, password_hash, role, is_active)
-            VALUES (?, ?, ?, 'user', 0)
-        ''', (tenant_id, username, generate_password_hash(password)))
-        conn.commit()
-
-    return jsonify({
-        'status': 'pending_approval',
-        'message': 'Registration submitted. Wait for admin approval.'
-    })
+    return jsonify({'error': 'Доступно только через Telegram Login'}), 410
 
 @app.route('/api/auth/me', methods=['GET'])
 def api_me():
     user = get_current_user()
     if not user:
         return jsonify({'authenticated': False}), 200
-    return jsonify({'authenticated': True, 'user': user})
+    billing = _billing_state(user.get('trial_ends_at'), user.get('subscription_expires_at'))
+    return jsonify({'authenticated': True, 'user': user, 'billing': billing})
+
+@app.route('/api/billing/status', methods=['GET'])
+def api_billing_status():
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    billing = _billing_state(user.get('trial_ends_at'), user.get('subscription_expires_at'))
+    return jsonify({
+        'status': 'ok',
+        'billing': {
+            'active': bool(billing.get('active')),
+            'mode': str(billing.get('mode') or ''),
+            'active_until': _format_db_datetime(billing['active_until']) if billing.get('active_until') else None,
+            'message': billing.get('message') or '',
+            'stars_price': BILLING_MONTHLY_STARS,
+            'trial_days': BILLING_TRIAL_DAYS
+        }
+    })
+
+@app.route('/api/billing/checkout', methods=['POST'])
+def api_billing_checkout():
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    invoice_url = _create_subscription_invoice_link(int(user.get('id') or 0), int(user.get('tenant_id') or 0))
+    if not invoice_url:
+        return jsonify({'error': 'Не удалось создать ссылку на оплату'}), 500
+    return jsonify({
+        'status': 'ok',
+        'payment_url': invoice_url,
+        'stars_price': BILLING_MONTHLY_STARS,
+        'plan_days': BILLING_PLAN_DAYS
+    })
 
 @app.route('/api/auth/change-password', methods=['POST'])
 def api_change_password():
@@ -1396,6 +3193,88 @@ def get_status():
     _refresh_checker_running_flag()
     return jsonify(checker_status)
 
+@app.route('/api/checker/accounts', methods=['GET'])
+def get_checker_accounts_live():
+    """
+    Синхронный список checker-аккаунтов для UI.
+    Без запуска async-контуров (иначе в eventlet/gunicorn возможен конфликт loop).
+    """
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    accounts = []
+
+    try:
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT
+                    phone,
+                    session_name,
+                    COALESCE(total_checks, 0),
+                    COALESCE(is_banned, 0),
+                    COALESCE(is_frozen, 0),
+                    COALESCE(test_quality, 'unknown'),
+                    COALESCE(checker_daily_limit, 20),
+                    COALESCE(last_check_date, '')
+                FROM account_stats
+                WHERE tenant_id = ?
+                  AND account_type = 'checker'
+            ''' + (
+                ''
+                if is_admin_user(user)
+                else ' AND (added_by_user_id = ? OR COALESCE(added_by_user_id, 0) = 0)'
+            ) + ' ORDER BY phone',
+                (tenant_id,) if is_admin_user(user) else (tenant_id, user_id)
+            )
+            rows = cursor.fetchall()
+
+        for row in rows:
+            phone = str(row[0] or '').strip()
+            session_name = str(row[1] or '').strip()
+            total_checked = int(row[2] or 0)
+            is_banned = bool(row[3])
+            is_frozen = bool(row[4])
+            test_quality = str(row[5] or 'unknown').strip().lower()
+            checker_daily_limit = max(1, int(row[6] or 20))
+            session_exists = bool(session_name and os.path.exists(os.path.join('sessions', f'{session_name}.session')))
+
+            # Для checker-экрана показываем только рабочие аккаунты:
+            # есть сессия, нет бана/фриза и аккаунт не помечен как bad.
+            # unknown считаем рабочим, потому что качество может быть не проставлено
+            # после миграции/переноса, но аккаунт физически доступен.
+            is_working = session_exists and not is_banned and not is_frozen and test_quality != 'bad'
+            if not is_working:
+                continue
+
+            try:
+                # sync=True держит checked_today/last_check_date в БД актуальными
+                # и устраняет рассинхрон счётчиков после перезагрузки интерфейса.
+                usage = db.get_effective_account_usage(phone, tenant_id=tenant_id, sync=True)
+            except Exception:
+                usage = {}
+            checked_today = int(usage.get('checked_today') or 0)
+            effective_daily_limit = int(usage.get('checker_daily_limit') or checker_daily_limit)
+            if checked_today > effective_daily_limit:
+                checked_today = effective_daily_limit
+
+            accounts.append({
+                'phone': phone,
+                'session_name': session_name,
+                'checked_today': checked_today,
+                'total_checked': total_checked,
+                'account_type': 'checker',
+                'test_quality': test_quality,
+                'daily_limit': effective_daily_limit,
+                'can_use': checked_today < effective_daily_limit,
+                'is_working': is_working
+            })
+    except Exception as e:
+        logger.error(f"Error in /api/checker/accounts: {e}")
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify(accounts)
+
 @app.route('/api/accounts')
 def get_accounts():
     tenant_id = get_current_tenant_id()
@@ -1425,6 +3304,7 @@ def get_accounts():
 def get_accounts_detailed():
     """Получение детальной информации об аккаунтах"""
     accounts = []
+    for_checker = str(request.args.get('for_checker') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
     tenant_id = get_current_tenant_id()
     user = get_current_user() or {}
     user_id = int(user.get('id') or 0)
@@ -1443,7 +3323,11 @@ def get_accounts_detailed():
                            COALESCE(a.checked_today, 0) as checked_today,
                            a.last_check_date,
                            COALESCE(a.outreach_daily_limit, 20) as outreach_daily_limit,
-                           f.device_model, f.app_version, f.system_version, f.lang_code
+                           COALESCE(a.checker_daily_limit, 20) as checker_daily_limit,
+                           f.device_model, f.app_version, f.system_version, f.lang_code,
+                           a.tenant_id as account_tenant_id,
+                           COALESCE(a.first_name, '') as first_name,
+                           COALESCE(a.last_name, '') as last_name
                     FROM account_stats a
                     LEFT JOIN account_fingerprints f ON a.phone = f.account_phone
                     WHERE a.tenant_id = ?
@@ -1461,64 +3345,136 @@ def get_accounts_detailed():
                            0 as checked_today,
                            date('now') as last_check_date,
                            20 as outreach_daily_limit,
-                           f.device_model, f.app_version, f.system_version, f.lang_code
+                           20 as checker_daily_limit,
+                           f.device_model, f.app_version, f.system_version, f.lang_code,
+                           a.tenant_id as account_tenant_id,
+                           '' as first_name,
+                           '' as last_name
                     FROM account_stats a
                     LEFT JOIN account_fingerprints f ON a.phone = f.account_phone
                     WHERE a.tenant_id = ?
                 ''' + ('' if is_admin_user(user) else ' AND a.added_by_user_id = ?'), (tenant_id,) if is_admin_user(user) else (tenant_id, user_id))
             
             for row in cursor.fetchall():
-                checked_today = row[11] or 0
-                last_check_date = row[12]
-                if last_check_date != date.today().isoformat():
-                    checked_today = 0
-                accounts.append({
-                    'phone': row[0],
-                    'session_name': row[1],
-                    'account_type': row[2] or 'checker',
+                phone = row[0]
+                session_name = row[1]
+                account_type = row[2] or 'checker'
+                is_banned = bool(row[6])
+                is_frozen = bool(row[7])
+                test_quality = row[4] or 'unknown'
+
+                usage = db.get_effective_account_usage(phone, tenant_id=tenant_id, sync=False)
+                checked_today = int(usage.get('checked_today') or 0)
+                last_check_date = usage.get('last_check_date')
+                checker_daily_limit = int(usage.get('checker_daily_limit') or 20)
+                outreach_daily_limit = int(usage.get('outreach_daily_limit') or 20)
+                effective_daily_limit = int(usage.get('effective_daily_limit') or 20)
+                can_use_today = checked_today < effective_daily_limit
+
+                session_exists = bool(session_name and os.path.exists(os.path.join('sessions', f'{session_name}.session')))
+                is_working_checker = (
+                    account_type == 'checker'
+                    and not is_banned
+                    and not is_frozen
+                    and session_exists
+                    and str(test_quality).lower() == 'good'
+                )
+
+                account_item = {
+                    'phone': phone,
+                    'session_name': session_name,
+                    'account_type': account_type,
                     'total_checked': row[3] or 0,
-                    'test_quality': row[4] or 'unknown',
+                    'test_quality': test_quality,
                     'last_check': row[5],
-                    'is_banned': bool(row[6]),
-                    'is_frozen': bool(row[7]),
+                    'is_banned': is_banned,
+                    'is_frozen': is_frozen,
                     'proxy_id': row[8],
                     'test_history': json.loads(row[9]) if row[9] else [],
                     'last_used': row[10],
                     'checked_today': checked_today,
                     'last_check_date': last_check_date,
-                    'outreach_daily_limit': row[13] or 20,
+                    'checker_daily_limit': checker_daily_limit,
+                    'outreach_daily_limit': outreach_daily_limit,
+                    'effective_daily_limit': effective_daily_limit,
+                    'can_use_today': can_use_today,
+                    'is_working_checker': is_working_checker,
+                    'session_exists': session_exists,
+                    'first_name': row[20] if len(row) > 20 else '',
+                    'last_name': row[21] if len(row) > 21 else '',
                     'fingerprint': {
-                        'device_model': row[14],
-                        'app_version': row[15],
-                        'system_version': row[16],
-                        'lang_code': row[17]
-                    } if len(row) > 14 and row[14] else None
-                })
+                        'device_model': row[15],
+                        'app_version': row[16],
+                        'system_version': row[17],
+                        'lang_code': row[18]
+                    } if len(row) > 15 and row[15] else None
+                }
+
+                if for_checker and not is_working_checker:
+                    continue
+                accounts.append(account_item)
     except Exception as e:
         logger.error(f"Error in get_accounts_detailed: {e}")
         return jsonify({'error': str(e)}), 500
     
     return jsonify(accounts)
 
-def _register_account_session(tenant_id: int, actor_id: int, phone: str, session_name: str):
+def _register_account_session(
+    tenant_id: int,
+    actor_id: int,
+    phone: str,
+    session_name: str,
+    first_name: str = '',
+    last_name: str = ''
+):
     """Регистрирует session в account_stats, если аккаунта ещё нет."""
+    first_name = str(first_name or '').strip()
+    last_name = str(last_name or '').strip()
     with sqlite3.connect(db.db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute('SELECT phone, session_name FROM account_stats WHERE tenant_id = ? AND phone = ?', (tenant_id, phone))
+        cursor.execute(
+            'SELECT phone, session_name FROM account_stats WHERE tenant_id = ? AND phone = ?',
+            (tenant_id, phone)
+        )
         existing = cursor.fetchone()
         if existing:
+            cursor.execute(
+                '''
+                UPDATE account_stats
+                SET session_name = ?,
+                    first_name = COALESCE(NULLIF(?, ''), first_name),
+                    last_name = COALESCE(NULLIF(?, ''), last_name)
+                WHERE tenant_id = ? AND phone = ?
+                ''',
+                (
+                    session_name or (existing[1] or ''),
+                    first_name,
+                    last_name,
+                    tenant_id,
+                    phone
+                )
+            )
+            conn.commit()
             return {
                 'status': 'exists',
                 'phone': existing[0],
-                'session_name': existing[1] or session_name,
+                'session_name': session_name or (existing[1] or ''),
                 'message': 'Аккаунт уже зарегистрирован'
             }
 
         cursor.execute('''
             INSERT INTO account_stats
-            (tenant_id, phone, session_name, account_type, is_banned, is_frozen, checked_today, last_check_date, added_by_user_id)
-            VALUES (?, ?, ?, 'checker', 0, 0, 0, ?, ?)
-        ''', (tenant_id, phone, session_name, date.today().isoformat(), actor_id if actor_id > 0 else None))
+            (tenant_id, phone, session_name, account_type, is_banned, is_frozen, checked_today, last_check_date, added_by_user_id, first_name, last_name)
+            VALUES (?, ?, ?, 'checker', 0, 0, 0, ?, ?, ?, ?)
+        ''', (
+            tenant_id,
+            phone,
+            session_name,
+            date.today().isoformat(),
+            actor_id if actor_id > 0 else None,
+            first_name,
+            last_name
+        ))
         conn.commit()
 
     try:
@@ -1697,7 +3653,9 @@ def get_qr_account_auth_status(token):
                 int(rec.get('tenant_id') or 1),
                 int(rec.get('actor_id') or 0),
                 phone,
-                str(rec.get('session_name') or '')
+                str(rec.get('session_name') or ''),
+                str(state.get('first_name') or ''),
+                str(state.get('last_name') or '')
             )
             with qr_auth_lock:
                 current = qr_auth_sessions.get(token)
@@ -1766,7 +3724,9 @@ def complete_qr_account_auth_2fa():
             int(rec.get('tenant_id') or 1),
             int(rec.get('actor_id') or 0),
             phone,
-            str(rec.get('session_name') or '')
+            str(rec.get('session_name') or ''),
+            str(result_2fa.get('first_name') or ''),
+            str(result_2fa.get('last_name') or '')
         )
         with qr_auth_lock:
             current = qr_auth_sessions.get(token)
@@ -1882,20 +3842,27 @@ def scan_new_sessions():
         try:
             from telethon import TelegramClient
             
-            async def get_phone():
+            async def get_account_meta():
                 client = None
                 try:
                     client = TelegramClient(f'sessions/{session_name}', int(api_id), api_hash)
                     await client.connect()
                     if await client.is_user_authorized():
                         me = await client.get_me()
-                        return me.phone
+                        return {
+                            'phone': str(getattr(me, 'phone', '') or '').strip(),
+                            'first_name': str(getattr(me, 'first_name', '') or '').strip(),
+                            'last_name': str(getattr(me, 'last_name', '') or '').strip()
+                        }
                     return None
                 finally:
                     if client:
                         await client.disconnect()
             
-            phone = run_async(get_phone())
+            account_meta = run_async(get_account_meta())
+            phone = str((account_meta or {}).get('phone') or '').strip()
+            first_name = str((account_meta or {}).get('first_name') or '').strip()
+            last_name = str((account_meta or {}).get('last_name') or '').strip()
             
             if phone:
                 logger.info(f"Получен номер {phone} для сессии {session_name}")
@@ -1905,9 +3872,26 @@ def scan_new_sessions():
                     cursor = conn.cursor()
                     cursor.execute('''
                         INSERT OR IGNORE INTO account_stats 
-                        (tenant_id, phone, session_name, account_type, is_banned, is_frozen, checked_today, last_check_date, added_by_user_id)
-                        VALUES (?, ?, ?, 'checker', 0, 0, 0, ?, ?)
-                    ''', (tenant_id, phone, session_name, date.today().isoformat(), actor_id if actor_id > 0 else None))
+                        (tenant_id, phone, session_name, account_type, is_banned, is_frozen, checked_today, last_check_date, added_by_user_id, first_name, last_name)
+                        VALUES (?, ?, ?, 'checker', 0, 0, 0, ?, ?, ?, ?)
+                    ''', (
+                        tenant_id,
+                        phone,
+                        session_name,
+                        date.today().isoformat(),
+                        actor_id if actor_id > 0 else None,
+                        first_name,
+                        last_name
+                    ))
+                    cursor.execute(
+                        '''
+                        UPDATE account_stats
+                        SET first_name = COALESCE(NULLIF(?, ''), first_name),
+                            last_name = COALESCE(NULLIF(?, ''), last_name)
+                        WHERE tenant_id = ? AND phone = ?
+                        ''',
+                        (first_name, last_name, tenant_id, phone)
+                    )
                     conn.commit()
                 
                 # Создаем fingerprint
@@ -1988,7 +3972,9 @@ def upload_session_file():
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or 'session probe failed')
         payload = json.loads(proc.stdout.strip() or '{}')
-        phone = payload.get('phone') if payload.get('ok') else None
+        phone = str(payload.get('phone') or '').strip() if payload.get('ok') else ''
+        first_name = str(payload.get('first_name') or '').strip()
+        last_name = str(payload.get('last_name') or '').strip()
 
         if not phone:
             try:
@@ -2001,6 +3987,16 @@ def upload_session_file():
             cursor = conn.cursor()
             cursor.execute('SELECT phone FROM account_stats WHERE tenant_id = ? AND phone = ?', (tenant_id, phone))
             if cursor.fetchone():
+                cursor.execute(
+                    '''
+                    UPDATE account_stats
+                    SET session_name = ?,
+                        first_name = COALESCE(NULLIF(?, ''), first_name),
+                        last_name = COALESCE(NULLIF(?, ''), last_name)
+                    WHERE tenant_id = ? AND phone = ?
+                    ''',
+                    (session_name, first_name, last_name, tenant_id, phone)
+                )
                 conn.commit()
                 return jsonify({
                     'status': 'exists',
@@ -2011,9 +4007,17 @@ def upload_session_file():
 
             cursor.execute('''
                 INSERT INTO account_stats
-                (tenant_id, phone, session_name, account_type, is_banned, is_frozen, checked_today, last_check_date, added_by_user_id)
-                VALUES (?, ?, ?, 'checker', 0, 0, 0, ?, ?)
-            ''', (tenant_id, phone, session_name, date.today().isoformat(), actor_id if actor_id > 0 else None))
+                (tenant_id, phone, session_name, account_type, is_banned, is_frozen, checked_today, last_check_date, added_by_user_id, first_name, last_name)
+                VALUES (?, ?, ?, 'checker', 0, 0, 0, ?, ?, ?, ?)
+            ''', (
+                tenant_id,
+                phone,
+                session_name,
+                date.today().isoformat(),
+                actor_id if actor_id > 0 else None,
+                first_name,
+                last_name
+            ))
             conn.commit()
 
         try:
@@ -2190,21 +4194,28 @@ def assign_proxy_to_accounts():
             proxy_id = int(proxy_id)
         except (TypeError, ValueError):
             return jsonify({'error': 'Invalid proxy_id'}), 400
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT 1 FROM proxies
+                WHERE tenant_id = ? AND id = ? AND added_by_user_id = ?
+                LIMIT 1
+                ''',
+                (tenant_id, proxy_id, user_id)
+            )
+            if not cursor.fetchone():
+                return jsonify({'error': 'Прокси не найден или недоступен'}), 404
     
     try:
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
             for phone in phones:
-                if is_admin_user(user):
-                    cursor.execute('''
-                        UPDATE account_stats SET proxy_id = ? WHERE tenant_id = ? AND phone = ?
-                    ''', (proxy_id, tenant_id, phone))
-                else:
-                    cursor.execute('''
-                        UPDATE account_stats
-                        SET proxy_id = ?
-                        WHERE tenant_id = ? AND phone = ? AND added_by_user_id = ?
-                    ''', (proxy_id, tenant_id, phone, user_id))
+                cursor.execute('''
+                    UPDATE account_stats
+                    SET proxy_id = ?
+                    WHERE tenant_id = ? AND phone = ? AND added_by_user_id = ?
+                ''', (proxy_id, tenant_id, phone, user_id))
             conn.commit()
     except Exception as e:
         logger.error(f"Error assigning proxy: {e}")
@@ -2227,14 +4238,11 @@ def unassign_proxy_from_accounts():
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
             for phone in phones:
-                if is_admin_user(user):
-                    cursor.execute('UPDATE account_stats SET proxy_id = NULL WHERE tenant_id = ? AND phone = ?', (tenant_id, phone))
-                else:
-                    cursor.execute('''
-                        UPDATE account_stats
-                        SET proxy_id = NULL
-                        WHERE tenant_id = ? AND phone = ? AND added_by_user_id = ?
-                    ''', (tenant_id, phone, user_id))
+                cursor.execute('''
+                    UPDATE account_stats
+                    SET proxy_id = NULL
+                    WHERE tenant_id = ? AND phone = ? AND added_by_user_id = ?
+                ''', (tenant_id, phone, user_id))
             conn.commit()
     except Exception as e:
         logger.error(f"Error unassigning proxy: {e}")
@@ -2246,6 +4254,7 @@ def unassign_proxy_from_accounts():
 def get_config():
     tenant_id = get_current_tenant_id()
     form_data = db.load_form_data(tenant_id=tenant_id)
+    form_data['target_chat'] = GLOBAL_TARGET_CHAT_INVITE
     return jsonify(form_data)
 
 @app.route('/api/save_config', methods=['POST'])
@@ -2253,19 +4262,17 @@ def save_config():
     data = request.get_json(silent=True) or {}
     tenant_id = get_current_tenant_id()
     api_id, api_hash = get_api_credentials(data)
-    target_chat = str(data.get('target_chat', '') or '').strip()
     db.save_form_data(
         api_id=api_id,
         api_hash=api_hash,
-        target_chat=target_chat,
+        target_chat=GLOBAL_TARGET_CHAT_INVITE,
         phones_text=data.get('phones_text', ''),
-        delay=int(data.get('delay', 2)),
+        delay=1,
         tenant_id=tenant_id
     )
     db.set_config('api_id', api_id, tenant_id=tenant_id)
     db.set_config('api_hash', api_hash, tenant_id=tenant_id)
-    if target_chat:
-        db.set_config('outreach_target_chat', target_chat, tenant_id=tenant_id)
+    db.set_config('outreach_target_chat', GLOBAL_TARGET_CHAT_INVITE, tenant_id=tenant_id)
     return jsonify({'status': 'saved'})
 
 @app.route('/api/history', methods=['GET'])
@@ -2337,6 +4344,7 @@ def join_chat():
 async def join_chat_async():
     data = request.get_json(silent=True) or {}
     chat_username = data.get('chat_username')
+    tenant_id = get_current_tenant_id()
     api_id, api_hash = get_api_credentials(data)
     
     if not chat_username:
@@ -2345,7 +4353,7 @@ async def join_chat_async():
     if not api_id or not api_hash:
         return jsonify({'error': 'API ID и API Hash не настроены'}), 400
     
-    manager = TelegramAccountManager(api_id, api_hash, 'sessions')
+    manager = TelegramAccountManager(api_id, api_hash, 'sessions', tenant_id=tenant_id)
     
     if not await manager.load_accounts():
         return jsonify({'error': 'Не удалось загрузить аккаунты'}), 400
@@ -2359,23 +4367,46 @@ async def join_chat_async():
 @app.route('/api/start', methods=['POST'])
 def start_checker():
     global checker_process, checker_status
+    ensure_checker_emitter_started()
     _refresh_checker_running_flag()
     if checker_status['running']:
         return jsonify({'error': 'Проверка уже запущена'}), 400
     
     data = request.get_json(silent=True) or {}
     tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
     api_id, api_hash = get_api_credentials(data)
-    target_chat = data.get('target_chat')
+    target_chat = GLOBAL_TARGET_CHAT_INVITE
     phones_text = data.get('phones')
-    delay = int(data.get('delay', 2))
+    # Для checker фиксируем безопасный постоянный темп.
+    delay = 1
+    save_to_base_raw = data.get('save_to_base')
+    save_to_base = save_to_base_raw is True or str(save_to_base_raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    requested_base_id = data.get('base_id')
+    requested_new_base_name = str(data.get('new_base_name') or '').strip()
+    # Если явно передан base_id — считаем, что пользователь хочет обогащать базу,
+    # даже если фронт не передал/сбросил save_to_base флаг.
+    if requested_base_id not in (None, '', 0, '0'):
+        save_to_base = True
+    raw_phone_metadata = data.get('phone_metadata') or {}
+    phone_metadata = {}
+    if isinstance(raw_phone_metadata, dict):
+        for key, value in raw_phone_metadata.items():
+            norm_key = _normalize_phone_value(key)
+            if not norm_key:
+                continue
+            if isinstance(value, dict):
+                phone_metadata[norm_key] = {
+                    'name': str(value.get('name') or '').strip() or None,
+                    'company': str(value.get('company') or '').strip() or None,
+                    'position': str(value.get('position') or '').strip() or None
+                }
+            else:
+                phone_metadata[norm_key] = {}
     if not api_id or not api_hash:
         return jsonify({'error': 'API ID и API Hash не настроены'}), 400
-    
-    # Проверяем обязательные поля
-    if not target_chat:
-        return jsonify({'error': 'Не указан целевой чат'}), 400
-    
+
     if not phones_text:
         return jsonify({'error': 'Нет номеров для проверки'}), 400
     
@@ -2383,32 +4414,72 @@ def start_checker():
     
     if not phones_list:
         return jsonify({'error': 'Нет номеров для проверки'}), 400
+
+    target_base_id = None
+    if save_to_base:
+        if requested_base_id:
+            try:
+                target_base_id = int(requested_base_id)
+            except Exception:
+                return jsonify({'error': 'Некорректный base_id'}), 400
+            if not get_base_for_current_user(target_base_id):
+                return jsonify({'error': 'База недоступна'}), 403
+        else:
+            base_name = requested_new_base_name or f"Проверка {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            target_base_id = outreach.create_base(
+                name=base_name,
+                tenant_id=tenant_id,
+                created_by_user_id=user_id
+            )
+    logger.info(
+        "Checker start: tenant=%s user=%s phones=%s save_to_base=%s requested_base_id=%s target_base_id=%s new_base_name=%s",
+        tenant_id, user_id, len(phones_list), save_to_base, requested_base_id, target_base_id, requested_new_base_name
+    )
     
     db.save_form_data(api_id, api_hash, target_chat, phones_text, delay, tenant_id=tenant_id)
     db.set_config('api_id', api_id, tenant_id=tenant_id)
     db.set_config('api_hash', api_hash, tenant_id=tenant_id)
     db.set_config('outreach_target_chat', target_chat, tenant_id=tenant_id)
+    db.set_config('checker_last_files', '[]', tenant_id=tenant_id)
     
     checker_status = {
         'running': True,
         'current_phone': '',
         'processed': 0,
         'total': len(phones_list),
+        'input_total': len(phones_list),
+        'unique_total': len(phones_list),
+        'skipped_duplicates': 0,
+        'skipped_existing_in_base': 0,
+        'skipped_history_registered': 0,
+        'skipped_history_not_registered': 0,
+        'skipped_history_total': 0,
         'registered': 0,
         'not_registered': 0,
         'errors': 0,
         'test_checks': 0,
         'accounts': [],
         'start_time': None,
-        'estimated_time': None
+        'estimated_time': None,
+        'recent_results': []
     }
     
     checker_process = TelegramCheckerThread(
-        api_id, api_hash, target_chat, phones_list, delay
+        api_id=api_id,
+        api_hash=api_hash,
+        target_chat=target_chat,
+        phones_list=phones_list,
+        delay=delay,
+        tenant_id=tenant_id,
+        target_base_id=target_base_id,
+        phone_metadata=phone_metadata
     )
     checker_process.start()
     
-    return jsonify({'status': 'started', 'total': len(phones_list)})
+    response = {'status': 'started', 'total': len(phones_list)}
+    if target_base_id:
+        response['base_id'] = target_base_id
+    return jsonify(response)
 
 @app.route('/api/stop', methods=['POST'])
 def stop_checker():
@@ -2431,20 +4502,100 @@ def upload_file():
         file.save(filepath)
         
         phones = []
+        phone_metadata = {}
+        parsed_rows = 0
+        detected_columns = {}
         try:
-            if filename.endswith('.csv'):
-                df = pd.read_csv(filepath)
-                for col in df.columns:
-                    if 'phone' in col.lower() or 'tel' in col.lower() or 'номер' in col.lower():
-                        phones = df[col].dropna().astype(str).tolist()
-                        break
-            else:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    phones = [line.strip() for line in f if line.strip()]
+            phones, phone_metadata, parsed_rows, detected_columns = _parse_checker_file(filepath)
         except Exception as e:
             return jsonify({'error': str(e)}), 400
-        
-        return jsonify({'phones': phones[:100]})
+        finally:
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+
+        return jsonify({
+            'phones': phones,
+            'phone_metadata': phone_metadata,
+            'total': len(phones),
+            'parsed_rows': parsed_rows,
+            'detected_columns': detected_columns
+        })
+
+
+@app.route('/api/files', methods=['GET'])
+def list_checker_files():
+    tenant_id = get_current_tenant_id()
+    scope = str(request.args.get('scope') or 'checker_last').strip().lower()
+    if scope != 'checker_last':
+        return jsonify([])
+
+    items = []
+    try:
+        raw = db.get_config('checker_last_files', default='[]', tenant_id=tenant_id)
+        parsed = json.loads(raw) if raw else []
+        if isinstance(parsed, list):
+            items = parsed
+    except Exception:
+        items = []
+
+    safe_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        filename = os.path.basename(str(item.get('filename') or '').strip())
+        if not filename:
+            continue
+        full_path = os.path.join(app.config['RESULTS_FOLDER'], filename)
+        if not os.path.exists(full_path):
+            continue
+        safe_items.append({
+            'filename': filename,
+            'type': str(item.get('type') or 'file'),
+            'created_at': item.get('created_at')
+        })
+
+    # Fallback для старых запусков (до персистентного сохранения списка файлов).
+    if not safe_items:
+        try:
+            all_files = []
+            for name in os.listdir(app.config['RESULTS_FOLDER']):
+                if not (
+                    name.startswith('registered_')
+                    or name.startswith('not_registered_')
+                    or name.startswith('errors_')
+                ):
+                    continue
+                full_path = os.path.join(app.config['RESULTS_FOLDER'], name)
+                if not os.path.isfile(full_path):
+                    continue
+                mtime = os.path.getmtime(full_path)
+                all_files.append((name, mtime))
+
+            if all_files:
+                all_files.sort(key=lambda x: x[1], reverse=True)
+                latest_mtime = all_files[0][1]
+                for name, mtime in all_files:
+                    # Берем файлы самого свежего запуска (окно 5 секунд).
+                    if latest_mtime - mtime > 5:
+                        continue
+                    ftype = 'file'
+                    if name.startswith('registered_'):
+                        ftype = 'registered'
+                    elif name.startswith('not_registered_'):
+                        ftype = 'not_registered'
+                    elif name.startswith('errors_'):
+                        ftype = 'errors'
+                    safe_items.append({
+                        'filename': name,
+                        'type': ftype,
+                        'created_at': datetime.fromtimestamp(mtime).isoformat()
+                    })
+        except Exception:
+            pass
+
+    return jsonify(safe_items)
 
 
 @app.route('/api/download/<filename>')
@@ -2462,22 +4613,33 @@ def get_proxies():
     """Получение списка прокси"""
     try:
         tenant_id = get_current_tenant_id()
+        user = get_current_user() or {}
+        user_id = int(user.get('id') or 0)
+        if user_id <= 0:
+            return jsonify({'error': 'Unauthorized'}), 401
         proxies = []
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, ip, port, protocol, username, password, country, is_active, last_used, created_at
                 FROM proxies
-                WHERE tenant_id = ?
+                WHERE tenant_id = ? AND added_by_user_id = ?
                 ORDER BY created_at DESC
-            ''', (tenant_id,))
+            ''', (tenant_id, user_id))
             for row in cursor.fetchall():
                 proxy = {
                     'id': row[0], 'ip': row[1], 'port': row[2], 'protocol': row[3],
                     'username': row[4], 'password': row[5], 'country': row[6],
                     'is_active': bool(row[7]), 'last_used': row[8], 'created_at': row[9]
                 }
-                cursor.execute('SELECT phone FROM account_stats WHERE tenant_id = ? AND proxy_id = ? LIMIT 1', (tenant_id, proxy['id']))
+                cursor.execute(
+                    '''
+                    SELECT phone FROM account_stats
+                    WHERE tenant_id = ? AND added_by_user_id = ? AND proxy_id = ?
+                    LIMIT 1
+                    ''',
+                    (tenant_id, user_id, proxy['id'])
+                )
                 account = cursor.fetchone()
                 proxy['assigned_to'] = account[0] if account else None
                 proxies.append(proxy)
@@ -2490,25 +4652,41 @@ def get_proxies():
 @app.route('/api/proxies', methods=['POST'])
 def add_proxy():
     """Добавление нового прокси"""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    if user_id <= 0:
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
+        ip = str(data.get('ip') or '').strip()
+        port_raw = data.get('port')
+        try:
+            port = int(port_raw)
+        except Exception:
+            port = None
+        protocol = (data.get('protocol') or 'socks5').strip().lower()
+        if not ip or not port:
+            return jsonify({'error': 'Укажите IP и порт'}), 400
+        if port <= 0:
+            return jsonify({'error': 'Неверный порт'}), 400
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id FROM proxies
-                WHERE tenant_id = ? AND ip = ? AND port = ? AND protocol = ?
-            ''', (tenant_id, data['ip'], data['port'], data.get('protocol', 'socks5')))
+                WHERE tenant_id = ? AND added_by_user_id = ? AND ip = ? AND port = ? AND protocol = ?
+            ''', (tenant_id, user_id, ip, port, protocol))
             if cursor.fetchone():
-                return jsonify({'error': 'Proxy already exists'}), 400
+                return jsonify({'error': 'Прокси уже существует'}), 400
             cursor.execute('''
-                INSERT INTO proxies (tenant_id, ip, port, protocol, username, password, country, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                INSERT INTO proxies (tenant_id, added_by_user_id, ip, port, protocol, username, password, country, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
             ''', (
                 tenant_id,
-                data['ip'],
-                data['port'],
-                data.get('protocol', 'socks5'),
+                user_id,
+                ip,
+                port,
+                protocol,
                 data.get('username'),
                 data.get('password'),
                 data.get('country')
@@ -2524,18 +4702,24 @@ def update_proxy(proxy_id):
     """Обновление прокси"""
     data = request.json
     tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    if user_id <= 0:
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE proxies 
                 SET ip=?, port=?, protocol=?, username=?, password=?, country=?
-                WHERE id=? AND tenant_id = ?
+                WHERE id=? AND tenant_id = ? AND added_by_user_id = ?
             ''', (
                 data['ip'], data['port'], data.get('protocol', 'socks5'),
                 data.get('username'), data.get('password'), data.get('country'),
-                proxy_id, tenant_id
+                proxy_id, tenant_id, user_id
             ))
+            if cursor.rowcount <= 0:
+                return jsonify({'error': 'Прокси не найден или недоступен'}), 404
             conn.commit()
         return jsonify({'status': 'updated'})
     except Exception as e:
@@ -2546,11 +4730,30 @@ def update_proxy(proxy_id):
 def delete_proxy(proxy_id):
     """Удаление прокси"""
     tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    if user_id <= 0:
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('UPDATE account_stats SET proxy_id = NULL WHERE tenant_id = ? AND proxy_id = ?', (tenant_id, proxy_id))
-            cursor.execute('DELETE FROM proxies WHERE tenant_id = ? AND id = ?', (tenant_id, proxy_id))
+            cursor.execute(
+                '''
+                UPDATE account_stats
+                SET proxy_id = NULL
+                WHERE tenant_id = ? AND added_by_user_id = ? AND proxy_id = ?
+                ''',
+                (tenant_id, user_id, proxy_id)
+            )
+            cursor.execute(
+                '''
+                DELETE FROM proxies
+                WHERE tenant_id = ? AND id = ? AND added_by_user_id = ?
+                ''',
+                (tenant_id, proxy_id, user_id)
+            )
+            if cursor.rowcount <= 0:
+                return jsonify({'error': 'Прокси не найден или недоступен'}), 404
             conn.commit()
         return jsonify({'status': 'deleted'})
     except Exception as e:
@@ -2565,9 +4768,19 @@ async def test_proxy_async(proxy_id):
     """Тестирование прокси"""
     try:
         tenant_id = get_current_tenant_id()
+        user = get_current_user() or {}
+        user_id = int(user.get('id') or 0)
+        if user_id <= 0:
+            return jsonify({'error': 'Unauthorized'}), 401
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM proxies WHERE tenant_id = ? AND id = ?', (tenant_id, proxy_id))
+            cursor.execute(
+                '''
+                SELECT 1 FROM proxies
+                WHERE tenant_id = ? AND id = ? AND added_by_user_id = ?
+                ''',
+                (tenant_id, proxy_id, user_id)
+            )
             if not cursor.fetchone():
                 return jsonify({'error': 'Proxy not found'}), 404
         working = await proxy_manager.test_proxy(proxy_id)
@@ -2584,9 +4797,19 @@ async def test_all_proxies_async():
     """Тестирование всех прокси"""
     try:
         tenant_id = get_current_tenant_id()
+        user = get_current_user() or {}
+        user_id = int(user.get('id') or 0)
+        if user_id <= 0:
+            return jsonify({'error': 'Unauthorized'}), 401
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id FROM proxies WHERE tenant_id = ?', (tenant_id,))
+            cursor.execute(
+                '''
+                SELECT id FROM proxies
+                WHERE tenant_id = ? AND added_by_user_id = ?
+                ''',
+                (tenant_id, user_id)
+            )
             proxy_ids = [int(r[0]) for r in cursor.fetchall()]
         results = {'working': 0, 'failed': 0, 'total': len(proxy_ids)}
         for pid in proxy_ids:
@@ -2604,6 +4827,10 @@ async def test_all_proxies_async():
 def import_proxies():
     """Импорт прокси из файла"""
     tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    if user_id <= 0:
+        return jsonify({'error': 'Unauthorized'}), 401
     if 'file' not in request.files:
         return jsonify({'error': 'No file'}), 400
     
@@ -2638,16 +4865,19 @@ def import_proxies():
             cursor = conn.cursor()
             for p in proxies:
                 cursor.execute(
-                    'SELECT id FROM proxies WHERE tenant_id = ? AND ip = ? AND port = ? AND protocol = ?',
-                    (tenant_id, p['ip'], p['port'], p.get('protocol', 'socks5'))
+                    '''
+                    SELECT id FROM proxies
+                    WHERE tenant_id = ? AND added_by_user_id = ? AND ip = ? AND port = ? AND protocol = ?
+                    ''',
+                    (tenant_id, user_id, p['ip'], p['port'], p.get('protocol', 'socks5'))
                 )
                 if cursor.fetchone():
                     skipped += 1
                     continue
                 cursor.execute('''
-                    INSERT INTO proxies (tenant_id, ip, port, protocol, username, password, country, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                ''', (tenant_id, p['ip'], p['port'], p.get('protocol', 'socks5'), p.get('username'), p.get('password'), p.get('country')))
+                    INSERT INTO proxies (tenant_id, added_by_user_id, ip, port, protocol, username, password, country, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ''', (tenant_id, user_id, p['ip'], p['port'], p.get('protocol', 'socks5'), p.get('username'), p.get('password'), p.get('country')))
                 added += 1
             conn.commit()
         return jsonify({'added': added, 'skipped': skipped, 'total': len(proxies)})
@@ -2660,9 +4890,19 @@ def delete_inactive_proxies():
     """Удаление всех неактивных прокси"""
     try:
         tenant_id = get_current_tenant_id()
+        user = get_current_user() or {}
+        user_id = int(user.get('id') or 0)
+        if user_id <= 0:
+            return jsonify({'error': 'Unauthorized'}), 401
         with sqlite3.connect(db.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM proxies WHERE tenant_id = ? AND is_active = FALSE', (tenant_id,))
+            cursor.execute(
+                '''
+                DELETE FROM proxies
+                WHERE tenant_id = ? AND added_by_user_id = ? AND is_active = FALSE
+                ''',
+                (tenant_id, user_id)
+            )
             deleted = cursor.rowcount
             conn.commit()
         return jsonify({'deleted': deleted})
@@ -3330,7 +5570,10 @@ def create_outreach_campaign():
     if not accounts:
         return jsonify({'error': 'Выберите минимум один активный outreach-аккаунт'}), 400
     strategy = data.get('strategy') or {'steps': []}
-    schedule = data.get('schedule') or None
+    followup_steps_count = _count_followup_steps(strategy)
+    schedule = _normalize_campaign_schedule(data.get('schedule') or {}, followup_steps_count)
+    capacity = _calculate_campaign_capacity(tenant_id, accounts, strategy)
+    daily_limit_auto = int(capacity.get('safe_new_per_day') or 0)
     base_id_raw = data.get('base_id')
     base_id = None
     if base_id_raw not in (None, '', 0, '0'):
@@ -3345,7 +5588,7 @@ def create_outreach_campaign():
             name=name,
             message_template=template,
             accounts=accounts,
-            daily_limit=int(data.get('dailyLimit', 10)),
+            daily_limit=daily_limit_auto,
             delay_min=int(data.get('delayMin', 5)),
             delay_max=int(data.get('delayMax', 15)),
             strategy=strategy,
@@ -3362,7 +5605,7 @@ def create_outreach_campaign():
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 400
-    return jsonify({'id': campaign_id})
+    return jsonify({'id': campaign_id, 'capacity': capacity})
 
 @app.route('/api/outreach/campaign/<int:campaign_id>', methods=['PUT'])
 def update_outreach_campaign(campaign_id):
@@ -3382,8 +5625,9 @@ def update_outreach_campaign(campaign_id):
     requested_accounts = data.get('accounts', campaign.get('accounts', []))
     accounts = filter_valid_outreach_accounts(requested_accounts)
 
-    schedule = data.get('schedule', campaign.get('schedule'))
     strategy = data.get('strategy', campaign.get('strategy') or {'steps': []})
+    followup_steps_count = _count_followup_steps(strategy)
+    schedule = _normalize_campaign_schedule(data.get('schedule', campaign.get('schedule') or {}), followup_steps_count)
     base_id_raw = data.get('base_id', campaign.get('base_id'))
     base_id = None
     if base_id_raw not in (None, '', 0, '0'):
@@ -3394,11 +5638,12 @@ def update_outreach_campaign(campaign_id):
         if not get_base_for_current_user(base_id):
             return jsonify({'error': 'База не найдена'}), 404
     try:
-        daily_limit = max(1, int(data.get('dailyLimit', campaign.get('daily_limit', 10))))
         delay_min = max(0, int(data.get('delayMin', campaign.get('delay_min', 5))))
         delay_max = max(delay_min, int(data.get('delayMax', campaign.get('delay_max', 15))))
     except (TypeError, ValueError):
         return jsonify({'error': 'Некорректные лимиты/задержка'}), 400
+    capacity = _calculate_campaign_capacity(tenant_id, accounts, strategy)
+    daily_limit = int(capacity.get('safe_new_per_day') or 0)
 
     try:
         old_base_id = int(campaign.get('base_id') or 0)
@@ -3451,7 +5696,11 @@ def update_outreach_campaign(campaign_id):
                 )
     except Exception as e:
         return jsonify({'error': str(e)}), 400
-    return jsonify({'status': 'updated', 'campaign': outreach.get_campaign(campaign_id, tenant_id=tenant_id)})
+    return jsonify({
+        'status': 'updated',
+        'campaign': outreach.get_campaign(campaign_id, tenant_id=tenant_id),
+        'capacity': capacity
+    })
 
 
 @app.route('/api/outreach/campaign/<int:campaign_id>', methods=['DELETE'])
@@ -3517,6 +5766,1167 @@ def get_campaign_contacts(campaign_id):
     limit = request.args.get('limit', 100, type=int)
     offset = request.args.get('offset', 0, type=int)
     return jsonify(outreach.get_campaign_contacts(campaign_id, limit=limit, offset=offset, tenant_id=tenant_id))
+
+def _parse_bool_arg(value) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+def _normalize_reply_username(username):
+    if not username:
+        return None
+    val = str(username).strip()
+    if not val:
+        return None
+    return val if val.startswith('@') else f"@{val}"
+
+def _normalize_reply_phone(phone):
+    raw = str(phone or '').strip()
+    if not raw:
+        return None
+    digits = ''.join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    if len(digits) == 11 and digits.startswith('8'):
+        digits = '7' + digits[1:]
+    if len(digits) == 10:
+        digits = '7' + digits
+    return f"+{digits}" if digits else None
+
+def _cleanup_temp_session_files(temp_base: str):
+    if not temp_base:
+        return
+    for suffix in ('.session', '.session-journal', '.session-shm', '.session-wal'):
+        try:
+            os.remove(temp_base + suffix)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+def _get_target_chat_for_tenant(tenant_id: int) -> str:
+    target_chat = str(db.get_config('outreach_target_chat', tenant_id=tenant_id) or '').strip()
+    if not target_chat:
+        target_chat = str(db.get_config('outreach_target_chat') or '').strip()
+    if not target_chat:
+        target_chat = str(os.getenv('OUTREACH_TARGET_CHAT') or '').strip()
+    if not target_chat:
+        target_chat = GLOBAL_TARGET_CHAT_INVITE
+    return normalize_chat_ref(target_chat)
+
+def _resolve_account_display_name(tenant_id: int, account_phone: str):
+    phone = str(account_phone or '').strip()
+    if not phone:
+        return None
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT first_name, last_name, session_name
+            FROM account_stats
+            WHERE tenant_id = ? AND phone = ?
+            LIMIT 1
+            ''',
+            (int(tenant_id), phone)
+        )
+        row = cursor.fetchone()
+    if not row:
+        return phone
+    first_name = str(row[0] or '').strip()
+    last_name = str(row[1] or '').strip()
+    session_name = str(row[2] or '').strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+    if full_name:
+        return full_name
+    if session_name:
+        return session_name
+    return phone
+
+def _get_replies_contact_for_current_user(contact_id: int):
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    is_admin = is_admin_user(user)
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        where_parts = [
+            'oc.id = ?',
+            'oc.tenant_id = ?'
+        ]
+        params = [int(contact_id), int(tenant_id)]
+        if not is_admin:
+            where_parts.append('cp.created_by_user_id = ?')
+            params.append(user_id)
+
+        cursor.execute(
+            f'''
+            SELECT
+                oc.id,
+                oc.tenant_id,
+                oc.campaign_id,
+                cp.name AS campaign_name,
+                COALESCE(NULLIF(oc.name, ''), NULLIF(oc.username, ''), NULLIF(oc.phone, ''), CAST(oc.user_id AS TEXT), '—') AS contact_name,
+                oc.status,
+                oc.user_id,
+                oc.username,
+                oc.phone,
+                oc.access_hash,
+                COALESCE(
+                    NULLIF(TRIM(oc.account_used), ''),
+                    (
+                        SELECT NULLIF(TRIM(om.account_used), '')
+                        FROM outreach_messages om
+                        WHERE om.tenant_id = oc.tenant_id
+                          AND om.contact_id = oc.id
+                          AND COALESCE(om.is_incoming, 0) = 0
+                          AND om.account_used IS NOT NULL
+                          AND TRIM(om.account_used) != ''
+                        ORDER BY datetime(om.sent_at) DESC, om.id DESC
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT NULLIF(TRIM(json_extract(cv.metadata, '$.account_used')), '')
+                        FROM conversations cv
+                        WHERE cv.tenant_id = oc.tenant_id
+                          AND cv.contact_id = oc.id
+                          AND cv.direction = 'outgoing'
+                          AND cv.metadata IS NOT NULL
+                          AND json_extract(cv.metadata, '$.account_used') IS NOT NULL
+                        ORDER BY datetime(cv.sent_at) DESC, cv.id DESC
+                        LIMIT 1
+                    )
+                ) AS reply_account
+            FROM outreach_contacts oc
+            JOIN outreach_campaigns cp
+              ON cp.id = oc.campaign_id
+             AND cp.tenant_id = oc.tenant_id
+            WHERE {' AND '.join(where_parts)}
+            LIMIT 1
+            ''',
+            params
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+    account_used = str(row[10] or '').strip() if row[10] else None
+    account_name = _resolve_account_display_name(int(row[1]), account_used) if account_used else None
+    return {
+        'contact_id': int(row[0]),
+        'tenant_id': int(row[1]),
+        'campaign_id': int(row[2]),
+        'campaign_name': str(row[3] or ''),
+        'name': str(row[4] or '—'),
+        'status': str(row[5] or ''),
+        'user_id': int(row[6]) if row[6] is not None else None,
+        'username': str(row[7] or '') if row[7] else None,
+        'phone': str(row[8] or '') if row[8] else None,
+        'access_hash': str(row[9] or '') if row[9] else None,
+        'account_used': account_used,
+        'account_name': account_name
+    }
+
+def _get_reply_account_config(tenant_id: int, account_phone: str, user: dict):
+    if not account_phone:
+        return None
+    uid = int((user or {}).get('id') or 0)
+    is_admin = is_admin_user(user)
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        where_parts = [
+            'a.tenant_id = ?',
+            'a.phone = ?',
+            "a.account_type = 'outreach'",
+            'COALESCE(a.is_banned, 0) = 0',
+            'COALESCE(a.is_frozen, 0) = 0'
+        ]
+        params = [int(tenant_id), str(account_phone).strip()]
+        if not is_admin:
+            where_parts.append('a.added_by_user_id = ?')
+            params.append(uid)
+        cursor.execute(
+            f'''
+            SELECT
+                a.phone,
+                a.session_name,
+                a.proxy_id,
+                COALESCE(f.device_model, 'Desktop') AS device_model,
+                COALESCE(f.app_version, '4.16.30') AS app_version,
+                COALESCE(f.lang_code, 'ru') AS lang_code,
+                COALESCE(f.system_lang_code, 'ru') AS system_lang_code
+            FROM account_stats a
+            LEFT JOIN account_fingerprints f
+              ON f.account_phone = a.phone
+             AND f.tenant_id = a.tenant_id
+            WHERE {' AND '.join(where_parts)}
+            LIMIT 1
+            ''',
+            params
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        proxy_cfg = None
+        proxy_id = row[2]
+        if proxy_id:
+            cursor.execute(
+                '''
+                SELECT ip, port, protocol, username, password, is_active
+                FROM proxies
+                WHERE id = ? AND tenant_id = ?
+                LIMIT 1
+                ''',
+                (proxy_id, int(tenant_id))
+            )
+            p = cursor.fetchone()
+            if p and int(p[5] or 0) == 1:
+                proxy_cfg = build_telethon_proxy_config({
+                    'ip': p[0],
+                    'port': p[1],
+                    'protocol': p[2],
+                    'username': p[3],
+                    'password': p[4],
+                    'is_active': bool(p[5])
+                })
+
+    return {
+        'phone': str(row[0] or '').strip(),
+        'session_name': str(row[1] or '').strip(),
+        'proxy': proxy_cfg,
+        'device_model': str(row[3] or 'Desktop'),
+        'app_version': str(row[4] or '4.16.30'),
+        'lang_code': str(row[5] or 'ru'),
+        'system_lang_code': str(row[6] or 'ru')
+    }
+
+async def _connect_reply_client_async(account_cfg: dict, api_id: str, api_hash: str):
+    session_name = str((account_cfg or {}).get('session_name') or '').strip()
+    if not session_name:
+        raise RuntimeError('У аккаунта не найден session_name')
+    session_src = os.path.join('sessions', session_name)
+    session_src_file = session_src + '.session'
+    if not os.path.exists(session_src_file):
+        raise RuntimeError(f'Файл сессии не найден: {session_name}.session')
+
+    os.makedirs(os.path.join(tempfile.gettempdir(), 'outreach_reply_sessions'), exist_ok=True)
+    temp_base = os.path.join(
+        tempfile.gettempdir(),
+        'outreach_reply_sessions',
+        f"{session_name}_{uuid.uuid4().hex}"
+    )
+    shutil.copy2(session_src_file, temp_base + '.session')
+
+    common_kwargs = {
+        'device_model': account_cfg.get('device_model') or 'Desktop',
+        'app_version': account_cfg.get('app_version') or '4.16.30',
+        'lang_code': account_cfg.get('lang_code') or 'ru',
+        'system_lang_code': account_cfg.get('system_lang_code') or 'ru'
+    }
+
+    last_error = None
+    for mode in ('proxy', 'direct'):
+        kwargs = dict(common_kwargs)
+        if mode == 'proxy':
+            proxy = account_cfg.get('proxy')
+            if not proxy:
+                continue
+            kwargs['proxy'] = proxy
+        client = TelegramClient(temp_base, api_id=int(api_id), api_hash=api_hash, **kwargs)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=20)
+            if not await asyncio.wait_for(client.is_user_authorized(), timeout=10):
+                await client.disconnect()
+                raise RuntimeError('Сессия не авторизована')
+            return client, temp_base
+        except Exception as e:
+            last_error = e
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            if mode == 'proxy':
+                logger.warning(
+                    "[replies] proxy failed for %s, fallback to direct: %s",
+                    account_cfg.get('phone'),
+                    e
+                )
+                continue
+            break
+
+    _cleanup_temp_session_files(temp_base)
+    raise RuntimeError(f'Не удалось подключить аккаунт: {last_error}')
+
+async def _ensure_client_in_target_chat_async(client, target_chat: str):
+    chat_ref = normalize_chat_ref(target_chat)
+    if not chat_ref:
+        return
+    try:
+        if '+' in chat_ref or 'joinchat' in chat_ref:
+            hash_part = chat_ref
+            if 'joinchat/' in hash_part:
+                hash_part = hash_part.split('joinchat/')[-1]
+            if hash_part.startswith('+'):
+                hash_part = hash_part[1:]
+            await client(ImportChatInviteRequest(hash_part))
+        else:
+            entity = await client.get_entity(chat_ref)
+            await client(JoinChannelRequest(entity))
+    except errors.UserAlreadyParticipantError:
+        return
+    except Exception as e:
+        if 'USER_ALREADY_PARTICIPANT' not in str(e):
+            logger.info("[replies] target chat join skipped: %s", e)
+
+async def _warm_reply_entity_from_target_chat_async(client, target_chat: str, user_id: int, limit: int = 1500):
+    if not user_id:
+        return
+    try:
+        await _ensure_client_in_target_chat_async(client, target_chat)
+        chat_entity = await client.get_entity(target_chat)
+        scanned = 0
+        async for msg in client.iter_messages(chat_entity, limit=max(50, int(limit))):
+            scanned += 1
+            sender_id = getattr(msg, 'sender_id', None)
+            if sender_id == user_id:
+                try:
+                    await msg.get_sender()
+                except Exception:
+                    pass
+                break
+        logger.info("[replies] warm target chat scanned=%s for user=%s", scanned, user_id)
+    except Exception as e:
+        logger.info("[replies] warm target chat failed for user %s: %s", user_id, e)
+
+async def _resolve_reply_entity_async(client, contact: dict, target_chat: str):
+    uid = None
+    try:
+        uid = int(contact.get('user_id')) if contact.get('user_id') is not None else None
+    except Exception:
+        uid = None
+    username = _normalize_reply_username(contact.get('username'))
+    phone = _normalize_reply_phone(contact.get('phone'))
+    access_hash = None
+    try:
+        access_hash = int(str(contact.get('access_hash') or '').strip())
+    except Exception:
+        access_hash = None
+
+    errors_seen = []
+    if username:
+        try:
+            return await client.get_input_entity(username)
+        except Exception as e:
+            errors_seen.append(f"username:{type(e).__name__}:{e}")
+
+    if uid and access_hash:
+        try:
+            return InputPeerUser(uid, access_hash)
+        except Exception as e:
+            errors_seen.append(f"id+hash:{type(e).__name__}:{e}")
+
+    if uid:
+        try:
+            return await client.get_input_entity(PeerUser(uid))
+        except Exception as e:
+            errors_seen.append(f"peer_user:{type(e).__name__}:{e}")
+
+        try:
+            return await client.get_input_entity(uid)
+        except Exception as e:
+            errors_seen.append(f"id:{type(e).__name__}:{e}")
+
+        await _warm_reply_entity_from_target_chat_async(client, target_chat, uid)
+        try:
+            return await client.get_input_entity(PeerUser(uid))
+        except Exception as e:
+            errors_seen.append(f"peer_after_warm:{type(e).__name__}:{e}")
+
+    if phone:
+        try:
+            import_result = await client(ImportContactsRequest([
+                InputPhoneContact(client_id=0, phone=phone, first_name='Reply', last_name='Contact')
+            ]))
+            if import_result.users:
+                return import_result.users[0]
+            errors_seen.append('phone_import:empty_result')
+        except Exception as e:
+            errors_seen.append(f"phone_import:{type(e).__name__}:{e}")
+
+    detail = " | ".join(errors_seen) if errors_seen else "no_identifiers"
+    raise RuntimeError(f"Не удалось определить чат контакта: {detail}")
+
+def _trim_reply_history(cursor, tenant_id: int, contact_id: int, keep_limit: int):
+    keep = max(50, min(int(keep_limit or 200), 500))
+    cursor.execute(
+        '''
+        DELETE FROM conversations
+        WHERE tenant_id = ?
+          AND contact_id = ?
+          AND id NOT IN (
+              SELECT id
+              FROM conversations
+              WHERE tenant_id = ?
+                AND contact_id = ?
+              ORDER BY datetime(sent_at) DESC, id DESC
+              LIMIT ?
+          )
+        ''',
+        (tenant_id, contact_id, tenant_id, contact_id, keep)
+    )
+
+def _load_reply_thread_from_db(tenant_id: int, contact_id: int, limit: int = 120):
+    safe_limit = max(20, min(int(limit or 120), 500))
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, message_id, direction, content, sent_at, COALESCE(is_unread, 0)
+            FROM conversations
+            WHERE tenant_id = ? AND contact_id = ?
+            ORDER BY datetime(sent_at) DESC, id DESC
+            LIMIT ?
+            ''',
+            (tenant_id, contact_id, safe_limit)
+        )
+        rows = cursor.fetchall()
+
+    rows.reverse()
+    messages = []
+    for row in rows:
+        content = str(row[3] or '')
+        messages.append({
+            'id': int(row[0]),
+            'message_id': int(row[1]) if row[1] is not None else None,
+            'direction': str(row[2] or ''),
+            'content': content if content else '',
+            'sent_at': row[4],
+            'is_unread': int(row[5] or 0)
+        })
+    return messages
+
+async def _sync_reply_thread_async(contact: dict, user: dict, api_id: str, api_hash: str, fetch_limit: int = 120, mark_read: bool = False):
+    def _parse_dt(value):
+        raw = str(value or '').strip()
+        if not raw:
+            return None
+        candidate = raw
+        if candidate.endswith('Z'):
+            candidate = f"{candidate[:-1]}+00:00"
+        for probe in (candidate, candidate.replace(' ', 'T')):
+            try:
+                return datetime.fromisoformat(probe)
+            except Exception:
+                pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(candidate, fmt)
+            except Exception:
+                pass
+        return None
+
+    tenant_id = int(contact['tenant_id'])
+    contact_id = int(contact['contact_id'])
+    account_phone = str(contact.get('account_used') or '').strip()
+    if not account_phone:
+        raise RuntimeError('Для контакта не найден аккаунт отправителя')
+
+    account_cfg = _get_reply_account_config(tenant_id, account_phone, user)
+    if not account_cfg:
+        raise RuntimeError(f'Аккаунт {account_phone} недоступен')
+
+    target_chat = _get_target_chat_for_tenant(tenant_id)
+    client = None
+    temp_base = None
+    inserted = 0
+    incoming_seen = False
+    fetched = 0
+    try:
+        client, temp_base = await _connect_reply_client_async(account_cfg, api_id, api_hash)
+        target = await _resolve_reply_entity_async(client, contact, target_chat)
+        tg_messages = await client.get_messages(target, limit=max(20, min(int(fetch_limit or 120), 300)))
+
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            for msg in reversed(list(tg_messages or [])):
+                if msg is None:
+                    continue
+                if getattr(msg, 'action', None) is not None:
+                    continue
+                fetched += 1
+                direction = 'outgoing' if bool(getattr(msg, 'out', False)) else 'incoming'
+                if direction == 'incoming':
+                    incoming_seen = True
+                text = str(getattr(msg, 'message', None) or getattr(msg, 'text', None) or '')
+                if not text and getattr(msg, 'media', None) is not None:
+                    text = '[media]'
+                sent_at = msg.date.isoformat() if getattr(msg, 'date', None) else datetime.now().isoformat()
+                message_id = int(msg.id) if getattr(msg, 'id', None) is not None else None
+                is_unread = 1 if bool(getattr(msg, 'unread', False)) else 0
+
+                exists = None
+                if message_id is not None:
+                    cursor.execute(
+                        '''
+                        SELECT id
+                        FROM conversations
+                        WHERE tenant_id = ? AND contact_id = ? AND message_id = ?
+                        LIMIT 1
+                        ''',
+                        (tenant_id, contact_id, message_id)
+                    )
+                    exists = cursor.fetchone()
+                if exists:
+                    cursor.execute(
+                        '''
+                        UPDATE conversations
+                        SET is_unread = ?,
+                            sent_at = COALESCE(NULLIF(sent_at, ''), ?),
+                            content = CASE
+                                WHEN COALESCE(content, '') = '' THEN ?
+                                ELSE content
+                            END
+                        WHERE id = ?
+                        ''',
+                        (is_unread, sent_at, text, int(exists[0]))
+                    )
+                    continue
+
+                # Легаси-склейка: старые исходящие могли быть записаны без message_id.
+                # Если нашли такую запись с тем же текстом/направлением — проставляем ей message_id,
+                # чтобы не плодить дубли при ручном "Обновить".
+                if message_id is not None:
+                    cursor.execute(
+                        '''
+                        SELECT id, sent_at
+                        FROM conversations
+                        WHERE tenant_id = ?
+                          AND contact_id = ?
+                          AND message_id IS NULL
+                          AND direction = ?
+                          AND COALESCE(content, '') = ?
+                        ORDER BY id DESC
+                        LIMIT 20
+                        ''',
+                        (tenant_id, contact_id, direction, text)
+                    )
+                    legacy_rows = cursor.fetchall()
+                    if legacy_rows:
+                        tg_dt = _parse_dt(sent_at)
+                        best_id = None
+                        best_delta = None
+                        for legacy_id, legacy_sent_at in legacy_rows:
+                            if best_id is None:
+                                best_id = int(legacy_id)
+                            if tg_dt is None:
+                                continue
+                            legacy_dt = _parse_dt(legacy_sent_at)
+                            if legacy_dt is None:
+                                continue
+                            delta = abs(
+                                (
+                                    tg_dt.replace(tzinfo=None) - legacy_dt.replace(tzinfo=None)
+                                ).total_seconds()
+                            )
+                            if delta > 7200:
+                                continue
+                            if best_delta is None or delta < best_delta:
+                                best_delta = delta
+                                best_id = int(legacy_id)
+                        if best_id is not None:
+                            cursor.execute(
+                                '''
+                                UPDATE conversations
+                                SET message_id = ?,
+                                    sent_at = COALESCE(NULLIF(sent_at, ''), ?),
+                                    is_unread = ?
+                                WHERE id = ?
+                                ''',
+                                (message_id, sent_at, is_unread, best_id)
+                            )
+                            continue
+
+                metadata = None
+                if direction == 'outgoing':
+                    metadata = json.dumps({'account_used': account_phone}, ensure_ascii=False)
+
+                cursor.execute(
+                    '''
+                    INSERT INTO conversations
+                    (tenant_id, campaign_id, contact_id, message_id, direction, content, sent_at, metadata, is_unread)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        tenant_id,
+                        int(contact['campaign_id']),
+                        contact_id,
+                        message_id,
+                        direction,
+                        text,
+                        sent_at,
+                        metadata,
+                        is_unread
+                    )
+                )
+                inserted += 1
+
+            if mark_read:
+                try:
+                    await client.send_read_acknowledge(target)
+                except Exception:
+                    pass
+                cursor.execute(
+                    '''
+                    UPDATE conversations
+                    SET is_unread = 0
+                    WHERE tenant_id = ? AND contact_id = ? AND direction = 'incoming'
+                    ''',
+                    (tenant_id, contact_id)
+                )
+
+            if incoming_seen:
+                cursor.execute(
+                    '''
+                    UPDATE outreach_contacts
+                    SET status = 'replied',
+                        replied_at = COALESCE(replied_at, CURRENT_TIMESTAMP)
+                    WHERE tenant_id = ? AND id = ? AND status IN ('new', 'sent', 'ignored')
+                    ''',
+                    (tenant_id, contact_id)
+                )
+                # Увеличиваем reply_count кампании только при фактическом переходе
+                # статуса контакта в replied.
+                if cursor.rowcount and int(cursor.rowcount) > 0:
+                    cursor.execute(
+                        '''
+                        UPDATE outreach_campaigns
+                        SET reply_count = reply_count + 1
+                        WHERE tenant_id = ? AND id = ?
+                        ''',
+                        (tenant_id, int(contact['campaign_id']))
+                    )
+
+            if not contact.get('account_used'):
+                cursor.execute(
+                    '''
+                    UPDATE outreach_contacts
+                    SET account_used = ?
+                    WHERE tenant_id = ? AND id = ? AND (account_used IS NULL OR TRIM(account_used) = '')
+                    ''',
+                    (account_phone, tenant_id, contact_id)
+                )
+
+            _trim_reply_history(cursor, tenant_id, contact_id, keep_limit=200)
+            conn.commit()
+
+        return {
+            'fetched': fetched,
+            'inserted': inserted,
+            'incoming_seen': incoming_seen,
+            'account_used': account_phone
+        }
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        if temp_base:
+            _cleanup_temp_session_files(temp_base)
+
+async def _send_reply_message_async(contact: dict, user: dict, api_id: str, api_hash: str, text: str = '', file_payload: dict = None):
+    tenant_id = int(contact['tenant_id'])
+    contact_id = int(contact['contact_id'])
+    account_phone = str(contact.get('account_used') or '').strip()
+    if not account_phone:
+        raise RuntimeError('Для контакта не найден аккаунт отправителя')
+
+    account_cfg = _get_reply_account_config(tenant_id, account_phone, user)
+    if not account_cfg:
+        raise RuntimeError(f'Аккаунт {account_phone} недоступен')
+
+    target_chat = _get_target_chat_for_tenant(tenant_id)
+    client = None
+    temp_base = None
+    temp_upload_path = None
+    try:
+        client, temp_base = await _connect_reply_client_async(account_cfg, api_id, api_hash)
+        target = await _resolve_reply_entity_async(client, contact, target_chat)
+        safe_text = str(text or '').strip()
+        safe_file = file_payload or None
+        file_name = None
+        has_file = bool(safe_file and safe_file.get('bytes'))
+        if has_file:
+            file_name = secure_filename(str(safe_file.get('filename') or 'attachment.bin'))
+            suffix = ''
+            if '.' in file_name:
+                suffix = f".{file_name.rsplit('.', 1)[-1]}"
+            with tempfile.NamedTemporaryFile(prefix='reply_upload_', suffix=suffix, delete=False) as tmp_f:
+                tmp_f.write(safe_file.get('bytes') or b'')
+                temp_upload_path = tmp_f.name
+            sent_msg = await client.send_file(
+                target,
+                temp_upload_path,
+                caption=safe_text or None,
+                force_document=True
+            )
+        else:
+            sent_msg = await client.send_message(target, safe_text)
+        sent_at = sent_msg.date.isoformat() if getattr(sent_msg, 'date', None) else datetime.now().isoformat()
+        msg_id = int(sent_msg.id) if getattr(sent_msg, 'id', None) is not None else None
+        content_text = safe_text
+        if has_file:
+            marker = f"[file: {file_name}]"
+            content_text = f"{marker}\n{safe_text}" if safe_text else marker
+        if not content_text:
+            content_text = '[без текста]'
+        meta_payload = {'account_used': account_phone, 'source': 'replies_ui'}
+        if has_file:
+            meta_payload['file_name'] = file_name
+            meta_payload['has_file'] = True
+
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                INSERT INTO conversations
+                (tenant_id, campaign_id, contact_id, message_id, direction, content, sent_at, metadata, is_unread)
+                VALUES (?, ?, ?, ?, 'outgoing', ?, ?, ?, 1)
+                ''',
+                (
+                    tenant_id,
+                    int(contact['campaign_id']),
+                    contact_id,
+                    msg_id,
+                    content_text,
+                    sent_at,
+                    json.dumps(meta_payload, ensure_ascii=False)
+                )
+            )
+            cursor.execute(
+                '''
+                INSERT INTO outreach_messages
+                (tenant_id, contact_id, account_used, message_text, sent_at, is_incoming)
+                VALUES (?, ?, ?, ?, ?, 0)
+                ''',
+                (tenant_id, contact_id, account_phone, content_text, sent_at)
+            )
+            cursor.execute(
+                '''
+                UPDATE outreach_contacts
+                SET account_used = COALESCE(NULLIF(TRIM(account_used), ''), ?),
+                    last_message = ?,
+                    message_sent_at = ?
+                WHERE tenant_id = ? AND id = ?
+                ''',
+                (account_phone, content_text, sent_at, tenant_id, contact_id)
+            )
+            _trim_reply_history(cursor, tenant_id, contact_id, keep_limit=200)
+            conn.commit()
+
+        return {
+            'message_id': msg_id,
+            'sent_at': sent_at,
+            'account_used': account_phone
+        }
+    finally:
+        if temp_upload_path:
+            try:
+                os.remove(temp_upload_path)
+            except Exception:
+                pass
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        if temp_base:
+            _cleanup_temp_session_files(temp_base)
+
+@app.route('/api/replies', methods=['GET'])
+def get_replies_feed():
+    tenant_id = get_current_tenant_id()
+    user = get_current_user() or {}
+    user_id = int(user.get('id') or 0)
+    is_admin = is_admin_user(user)
+
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    campaign_id = request.args.get('campaign_id', type=int)
+    user_id_filter_raw = str(request.args.get('user_id') or '').strip()
+    user_id_filter = None
+    if user_id_filter_raw:
+        if not user_id_filter_raw.isdigit():
+            return jsonify({'error': 'user_id должен быть числом'}), 400
+        user_id_filter = int(user_id_filter_raw)
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+
+        # Кампании, доступные пользователю, для фильтра в UI.
+        if is_admin:
+            cursor.execute(
+                '''
+                SELECT id, name
+                FROM outreach_campaigns
+                WHERE tenant_id = ?
+                ORDER BY datetime(created_at) DESC, id DESC
+                ''',
+                (tenant_id,)
+            )
+        else:
+            cursor.execute(
+                '''
+                SELECT id, name
+                FROM outreach_campaigns
+                WHERE tenant_id = ?
+                  AND created_by_user_id = ?
+                ORDER BY datetime(created_at) DESC, id DESC
+                ''',
+                (tenant_id, user_id)
+            )
+        campaigns = [{'id': int(row[0]), 'name': str(row[1] or '')} for row in cursor.fetchall()]
+
+        where_parts = [
+            "oc.tenant_id = ?",
+            "oc.status = 'replied'"
+        ]
+        params = [tenant_id]
+        if not is_admin:
+            where_parts.append("cp.created_by_user_id = ?")
+            params.append(user_id)
+        if campaign_id:
+            where_parts.append("oc.campaign_id = ?")
+            params.append(int(campaign_id))
+        if user_id_filter is not None:
+            where_parts.append("oc.user_id = ?")
+            params.append(int(user_id_filter))
+        where_sql = " AND ".join(where_parts)
+
+        cursor.execute(
+            f'''
+            SELECT COUNT(*)
+            FROM outreach_contacts oc
+            JOIN outreach_campaigns cp
+              ON cp.id = oc.campaign_id
+             AND cp.tenant_id = oc.tenant_id
+            WHERE {where_sql}
+            ''',
+            params
+        )
+        total = int(cursor.fetchone()[0] or 0)
+
+        row_params = [*params, limit, offset]
+        cursor.execute(
+            f'''
+            SELECT
+                oc.id AS contact_id,
+                oc.campaign_id,
+                cp.name AS campaign_name,
+                COALESCE(NULLIF(oc.name, ''), NULLIF(oc.username, ''), NULLIF(oc.phone, ''), CAST(oc.user_id AS TEXT), '—') AS contact_name,
+                oc.status,
+                oc.user_id,
+                oc.username,
+                COALESCE(
+                    NULLIF(TRIM(oc.account_used), ''),
+                    (
+                        SELECT NULLIF(TRIM(om.account_used), '')
+                        FROM outreach_messages om
+                        WHERE om.tenant_id = oc.tenant_id
+                          AND om.contact_id = oc.id
+                          AND COALESCE(om.is_incoming, 0) = 0
+                          AND om.account_used IS NOT NULL
+                          AND TRIM(om.account_used) != ''
+                        ORDER BY datetime(om.sent_at) DESC, om.id DESC
+                        LIMIT 1
+                    )
+                ) AS account_used,
+                (
+                    SELECT COALESCE(NULLIF(TRIM(cv.content), ''), '[без текста]')
+                    FROM conversations cv
+                    WHERE cv.tenant_id = oc.tenant_id
+                      AND cv.contact_id = oc.id
+                      AND cv.direction = 'incoming'
+                    ORDER BY datetime(cv.sent_at) ASC, cv.id ASC
+                    LIMIT 1
+                ) AS first_reply_text,
+                (
+                    SELECT cv.sent_at
+                    FROM conversations cv
+                    WHERE cv.tenant_id = oc.tenant_id
+                      AND cv.contact_id = oc.id
+                      AND cv.direction = 'incoming'
+                    ORDER BY datetime(cv.sent_at) ASC, cv.id ASC
+                    LIMIT 1
+                ) AS first_reply_at,
+                (
+                    SELECT COALESCE(NULLIF(TRIM(cv.content), ''), '[без текста]')
+                    FROM conversations cv
+                    WHERE cv.tenant_id = oc.tenant_id
+                      AND cv.contact_id = oc.id
+                    ORDER BY datetime(cv.sent_at) DESC, cv.id DESC
+                    LIMIT 1
+                ) AS last_message_text,
+                (
+                    SELECT cv.sent_at
+                    FROM conversations cv
+                    WHERE cv.tenant_id = oc.tenant_id
+                      AND cv.contact_id = oc.id
+                    ORDER BY datetime(cv.sent_at) DESC, cv.id DESC
+                    LIMIT 1
+                ) AS last_message_at
+            FROM outreach_contacts oc
+            JOIN outreach_campaigns cp
+              ON cp.id = oc.campaign_id
+             AND cp.tenant_id = oc.tenant_id
+            WHERE {where_sql}
+            ORDER BY datetime(
+                COALESCE(
+                    (
+                        SELECT cv.sent_at
+                        FROM conversations cv
+                        WHERE cv.tenant_id = oc.tenant_id
+                          AND cv.contact_id = oc.id
+                        ORDER BY datetime(cv.sent_at) DESC, cv.id DESC
+                        LIMIT 1
+                    ),
+                    oc.replied_at,
+                    oc.message_sent_at
+                )
+            ) DESC,
+            oc.id DESC
+            LIMIT ? OFFSET ?
+            ''',
+            row_params
+        )
+        rows = cursor.fetchall()
+
+    account_name_map = {}
+    account_phones = sorted({
+        str(row[7] or '').strip()
+        for row in rows
+        if row[7] is not None and str(row[7]).strip()
+    })
+    if account_phones:
+        placeholders = ','.join(['?'] * len(account_phones))
+        with sqlite3.connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'''
+                SELECT phone, first_name, last_name, session_name
+                FROM account_stats
+                WHERE tenant_id = ? AND phone IN ({placeholders})
+                ''',
+                [tenant_id, *account_phones]
+            )
+            for phone, first_name, last_name, session_name in cursor.fetchall():
+                full_name = " ".join(
+                    part for part in (str(first_name or '').strip(), str(last_name or '').strip()) if part
+                ).strip()
+                account_name_map[str(phone).strip()] = full_name or str(session_name or '').strip() or str(phone).strip()
+
+    items = []
+    for row in rows:
+        account_used = str(row[7] or '').strip() if row[7] else None
+        items.append({
+            'contact_id': int(row[0]),
+            'campaign_id': int(row[1]),
+            'campaign_name': str(row[2] or ''),
+            'name': str(row[3] or ''),
+            'status': str(row[4] or ''),
+            'user_id': int(row[5]) if row[5] is not None else None,
+            'username': str(row[6] or '') if row[6] else None,
+            'account_used': account_used,
+            'account_name': account_name_map.get(account_used or '', account_used),
+            'first_reply_text': str(row[8] or '[без текста]'),
+            'first_reply_at': row[9],
+            'last_message_text': str(row[10] or '[без текста]'),
+            'last_message_at': row[11]
+        })
+
+    return jsonify({
+        'items': items,
+        'total': total,
+        'limit': limit,
+        'offset': offset,
+        'campaigns': campaigns,
+        'user_id_filter': user_id_filter
+    })
+
+@app.route('/api/replies/<int:contact_id>/thread', methods=['GET'])
+def get_reply_thread(contact_id: int):
+    user = get_current_user() or {}
+    contact = _get_replies_contact_for_current_user(contact_id)
+    if not contact:
+        return jsonify({'error': 'Контакт не найден'}), 404
+
+    safe_limit = max(20, min(int(request.args.get('limit', 120) or 120), 500))
+    need_sync = _parse_bool_arg(request.args.get('sync'))
+    sync_result = None
+
+    if need_sync:
+        api_id, api_hash = get_api_credentials()
+        if not api_id or not api_hash:
+            return jsonify({'error': 'API ID и API Hash не настроены'}), 400
+        try:
+            sync_result = run_async_threadsafe(
+                _sync_reply_thread_async(
+                    contact=contact,
+                    user=user,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    fetch_limit=min(300, safe_limit + 80),
+                    mark_read=True
+                )
+            )
+        except Exception as e:
+            logger.error("Reply thread sync failed for contact %s: %s", contact_id, e)
+            return jsonify({'error': str(e)}), 400
+        # Перечитываем контакт (account_used мог обновиться).
+        contact = _get_replies_contact_for_current_user(contact_id) or contact
+
+    messages = _load_reply_thread_from_db(contact['tenant_id'], contact['contact_id'], limit=safe_limit)
+    return jsonify({
+        'contact': {
+            'contact_id': int(contact['contact_id']),
+            'campaign_id': int(contact['campaign_id']),
+            'campaign_name': contact.get('campaign_name') or '',
+            'name': contact.get('name') or '—',
+            'user_id': contact.get('user_id'),
+            'username': contact.get('username'),
+            'phone': contact.get('phone'),
+            'account_used': contact.get('account_used'),
+            'account_name': contact.get('account_name')
+        },
+        'messages': messages,
+        'count': len(messages),
+        'synced': bool(sync_result is not None),
+        'sync_result': sync_result
+    })
+
+@app.route('/api/replies/<int:contact_id>/reload', methods=['POST'])
+def reload_reply_thread(contact_id: int):
+    user = get_current_user() or {}
+    contact = _get_replies_contact_for_current_user(contact_id)
+    if not contact:
+        return jsonify({'error': 'Контакт не найден'}), 404
+    api_id, api_hash = get_api_credentials()
+    if not api_id or not api_hash:
+        return jsonify({'error': 'API ID и API Hash не настроены'}), 400
+    try:
+        sync_result = run_async_threadsafe(
+            _sync_reply_thread_async(
+                contact=contact,
+                user=user,
+                api_id=api_id,
+                api_hash=api_hash,
+                fetch_limit=220,
+                mark_read=True
+            )
+        )
+    except Exception as e:
+        logger.error("Reply thread manual reload failed for contact %s: %s", contact_id, e)
+        return jsonify({'error': str(e)}), 400
+
+    contact = _get_replies_contact_for_current_user(contact_id) or contact
+    messages = _load_reply_thread_from_db(contact['tenant_id'], contact['contact_id'], limit=160)
+    return jsonify({
+        'status': 'reloaded',
+        'contact': {
+            'contact_id': int(contact['contact_id']),
+            'campaign_id': int(contact['campaign_id']),
+            'campaign_name': contact.get('campaign_name') or '',
+            'name': contact.get('name') or '—',
+            'user_id': contact.get('user_id'),
+            'username': contact.get('username'),
+            'phone': contact.get('phone'),
+            'account_used': contact.get('account_used'),
+            'account_name': contact.get('account_name')
+        },
+        'messages': messages,
+        'count': len(messages),
+        'sync_result': sync_result
+    })
+
+@app.route('/api/replies/<int:contact_id>/send', methods=['POST'])
+def send_reply_message(contact_id: int):
+    user = get_current_user() or {}
+    content_type = str(request.content_type or '').lower()
+    text = ''
+    upload = None
+    if 'multipart/form-data' in content_type:
+        text = str(request.form.get('text') or '').strip()
+        upload = request.files.get('file')
+    else:
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get('text') or '').strip()
+
+    if len(text) > 4096:
+        return jsonify({'error': 'Сообщение слишком длинное (макс. 4096 символов)'}), 400
+
+    file_payload = None
+    if upload and upload.filename:
+        filename = secure_filename(str(upload.filename or '').strip()) or 'attachment.bin'
+        file_bytes = upload.read() or b''
+        if not file_bytes:
+            return jsonify({'error': 'Файл пустой'}), 400
+        if len(file_bytes) > 50 * 1024 * 1024:
+            return jsonify({'error': 'Файл слишком большой (макс. 50 МБ)'}), 400
+        file_payload = {
+            'filename': filename,
+            'bytes': file_bytes
+        }
+
+    if not text and not file_payload:
+        return jsonify({'error': 'Укажите текст сообщения или прикрепите файл'}), 400
+
+    contact = _get_replies_contact_for_current_user(contact_id)
+    if not contact:
+        return jsonify({'error': 'Контакт не найден'}), 404
+    if not contact.get('account_used'):
+        return jsonify({'error': 'У контакта не определён аккаунт отправителя'}), 400
+
+    api_id, api_hash = get_api_credentials()
+    if not api_id or not api_hash:
+        return jsonify({'error': 'API ID и API Hash не настроены'}), 400
+
+    try:
+        sent = run_async_threadsafe(
+            _send_reply_message_async(
+                contact=contact,
+                user=user,
+                api_id=api_id,
+                api_hash=api_hash,
+                text=text,
+                file_payload=file_payload
+            )
+        )
+    except Exception as e:
+        logger.error("Reply send failed for contact %s: %s", contact_id, e)
+        return jsonify({'error': str(e)}), 400
+
+    contact = _get_replies_contact_for_current_user(contact_id) or contact
+    messages = _load_reply_thread_from_db(contact['tenant_id'], contact['contact_id'], limit=160)
+    return jsonify({
+        'status': 'sent',
+        'sent': sent,
+        'contact': {
+            'contact_id': int(contact['contact_id']),
+            'campaign_id': int(contact['campaign_id']),
+            'campaign_name': contact.get('campaign_name') or '',
+            'name': contact.get('name') or '—',
+            'user_id': contact.get('user_id'),
+            'username': contact.get('username'),
+            'phone': contact.get('phone'),
+            'account_used': contact.get('account_used'),
+            'account_name': contact.get('account_name')
+        },
+        'messages': messages,
+        'count': len(messages)
+    })
 
 @app.route('/api/outreach/blacklist', methods=['GET'])
 def get_outreach_blacklist():
@@ -3621,13 +7031,16 @@ def start_campaign(campaign_id):
     valid_accounts = filter_valid_outreach_accounts(campaign.get('accounts') or [])
     if not valid_accounts:
         return jsonify({'error': 'У кампании нет активных outreach-аккаунтов'}), 400
-    if valid_accounts != (campaign.get('accounts') or []):
+    capacity = _calculate_campaign_capacity(tenant_id, valid_accounts, campaign.get('strategy') or {})
+    daily_limit_auto = int(capacity.get('safe_new_per_day') or 0)
+    current_daily_limit = int(campaign.get('daily_limit') or 0)
+    if valid_accounts != (campaign.get('accounts') or []) or current_daily_limit != daily_limit_auto:
         outreach.update_campaign(
             campaign_id=campaign_id,
             name=campaign['name'],
             message_template=campaign['message_template'],
             accounts=valid_accounts,
-            daily_limit=int(campaign.get('daily_limit') or 10),
+            daily_limit=daily_limit_auto,
             delay_min=int(campaign.get('delay_min') or 5),
             delay_max=int(campaign.get('delay_max') or 15),
             strategy=campaign.get('strategy') or {'steps': []},
@@ -3660,6 +7073,11 @@ def start_campaign(campaign_id):
         contacts_ready = cursor.fetchone()[0] or 0
     if contacts_ready == 0:
         return jsonify({'error': 'Нет новых контактов с user_id/username/phone для рассылки'}), 400
+
+    try:
+        run_async(ensure_outreach_accounts_in_global_target_chat(tenant_id, account_phones=valid_accounts))
+    except Exception as e:
+        logger.warning(f"Could not ensure global target chat before campaign start #{campaign_id}: {e}")
 
     # Важно: сначала ставим active, чтобы первый тик планировщика сразу увидел кампанию.
     outreach.update_campaign_status(campaign_id, 'active', tenant_id=tenant_id)
@@ -3740,6 +7158,7 @@ def campaign_readiness(campaign_id):
     api_id, api_hash = get_api_credentials()
     has_api = bool(api_id and api_hash)
     valid_accounts = filter_valid_outreach_accounts(campaign.get('accounts') or [])
+    capacity = _calculate_campaign_capacity(tenant_id, valid_accounts, campaign.get('strategy') or {})
     has_accounts = bool(valid_accounts)
     has_contacts = bool((contacts_total or 0) > 0 or (base_contacts_total or 0) > 0)
     has_targets = bool((new_contacts or 0) > 0 or (base_contacts_total or 0) > 0)
@@ -3780,6 +7199,12 @@ def campaign_readiness(campaign_id):
         'has_accounts': has_accounts,
         'accounts_selected': len(campaign.get('accounts') or []),
         'accounts_valid': len(valid_accounts),
+        'followup_steps': int(capacity.get('followup_steps') or 0),
+        'waves_required': int(capacity.get('waves_required') or 1),
+        'safe_new_per_day': int(capacity.get('safe_new_per_day') or 0),
+        'primary_accounts_per_day': int(capacity.get('primary_accounts_per_day') or 0),
+        'shortage_for_rotation': int(capacity.get('shortage_for_rotation') or 0),
+        'accounts_to_add_for_next_step': int(capacity.get('accounts_to_add_for_next_step') or 0),
         'contacts_total': contacts_total or 0,
         'contacts_with_user_id': contacts_with_user_id or 0,
         'contacts_with_username': contacts_with_username or 0,
@@ -4099,7 +7524,16 @@ def update_account_type(phone):
             conn.commit()
             if cursor.rowcount == 0:
                 return jsonify({'error': 'Account not found'}), 404
-        return jsonify({'status': 'updated'})
+        joined = None
+        if account_type == 'outreach':
+            try:
+                joined = run_async(ensure_outreach_accounts_in_global_target_chat(tenant_id, account_phones=[phone]))
+            except Exception as e:
+                logger.warning(f"Failed to ensure global target chat for {phone}: {e}")
+        response = {'status': 'updated'}
+        if joined is not None:
+            response['target_chat_sync'] = joined
+        return jsonify(response)
     except Exception as e:
         logger.error(f"Error updating account type: {e}")
         return jsonify({'error': str(e)}), 500
@@ -4208,10 +7642,13 @@ def save_campaign_schedule(campaign_id):
     """Сохранение расписания для кампании"""
     data = request.get_json(silent=True) or {}
     tenant_id = get_current_tenant_id()
-    if not get_campaign_for_current_user(campaign_id):
+    campaign = get_campaign_for_current_user(campaign_id)
+    if not campaign:
         return jsonify({'error': 'Campaign not found'}), 404
     if not isinstance(data, dict):
         return jsonify({'error': 'Invalid schedule payload'}), 400
+    followup_steps_count = _count_followup_steps(campaign.get('strategy') or {})
+    normalized_schedule = _normalize_campaign_schedule(data, followup_steps_count)
 
     with sqlite3.connect(db.db_path) as conn:
         cursor = conn.cursor()
@@ -4219,10 +7656,10 @@ def save_campaign_schedule(campaign_id):
             UPDATE outreach_campaigns 
             SET schedule = ? 
             WHERE id = ? AND tenant_id = ?
-        ''', (json.dumps(data), campaign_id, tenant_id))
+        ''', (json.dumps(normalized_schedule), campaign_id, tenant_id))
         conn.commit()
 
-    return jsonify({'status': 'saved'})
+    return jsonify({'status': 'saved', 'schedule': normalized_schedule})
 
 
 @socketio.on('connect')
@@ -4236,7 +7673,7 @@ def health():
 if __name__ == '__main__':
     acquire_single_process_lock()
     print("=" * 50)
-    print("🚀 Telegram Outreach Platform запущена!")
+    print("🚀 воронка запущена!")
     print("=" * 50)
     print("📱 Проверка номеров: http://localhost:5001")
     print("📨 Аутрич кампании: http://localhost:5001/outreach")
@@ -4252,6 +7689,11 @@ if __name__ == '__main__':
             print("ℹ Планировщик рассылок уже запущен")
     else:
         print("ℹ Автостарт планировщика отключен (AUTO_START_SCHEDULER=1 чтобы включить)")
+    if BILLING_BOT_POLLING_ENABLED:
+        if ensure_billing_worker_running():
+            print("▶ Billing worker запущен (Telegram Stars)")
+        else:
+            print("ℹ Billing worker не запущен (проверьте bot token)")
     debug_mode = os.getenv('FLASK_DEBUG', '0') == '1'
     port = int(os.getenv('PORT', '5001'))
     socketio.run(
